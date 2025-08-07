@@ -67,10 +67,14 @@ class QQStockEmailNotifier:
         # 如果环境变量不存在，使用默认值
         if not self.sender_email:
             self.sender_email = "rofanyou@qq.com"  # 你的QQ邮箱
+            logger.warning("QQ_EMAIL_SENDER未设置，使用默认值")
             
         if not self.sender_password:
-            # 注意：实际使用时应该从环境变量读取，不要硬编码
-            self.sender_password = os.environ.get('QQ_EMAIL_PASSWORD', '')
+            logger.error("QQ_EMAIL_PASSWORD环境变量未设置！")
+            # 在GitHub Actions中，如果密码未设置，应该报错退出
+            if 'GITHUB_ACTIONS' in os.environ:
+                raise ValueError("QQ_EMAIL_PASSWORD必须在GitHub Secrets中设置")
+            self.sender_password = ""  # 本地测试时可以为空
             
         if not self.receiver_emails or self.receiver_emails == ['']:
             # 默认发送给自己
@@ -81,6 +85,7 @@ class QQStockEmailNotifier:
         
         logger.info(f"发件邮箱: {self.sender_email}")
         logger.info(f"收件邮箱: {', '.join(self.receiver_emails)}")
+        logger.info(f"密码已设置: {'是' if self.sender_password else '否'}")
     
     def is_trading_day(self):
         """判断今天是否是交易日"""
@@ -234,26 +239,41 @@ class QQStockEmailNotifier:
     
     def send_email(self, msg, retry_times=3):
         """发送邮件（支持重试）"""
+        if not self.sender_password:
+            logger.error("无法发送邮件：密码未设置")
+            return False
+            
         for attempt in range(retry_times):
             try:
                 logger.info(f"尝试发送邮件 (第{attempt + 1}次)...")
+                logger.info(f"发件人: {self.sender_email}")
+                logger.info(f"收件人: {', '.join(self.receiver_emails)}")
                 logger.info(f"连接到QQ邮箱SMTP服务器: {self.smtp_server}:{self.smtp_port}")
                 
                 # 连接到QQ邮箱SMTP服务器
                 server = smtplib.SMTP(self.smtp_server, self.smtp_port)
+                server.set_debuglevel(1)  # 开启调试信息
                 server.starttls()  # 启用TLS加密
+                logger.info(f"正在登录: {self.sender_email}")
                 server.login(self.sender_email, self.sender_password)
+                logger.info("登录成功")
                 
                 # 发送邮件给所有收件人
                 text = msg.as_string()
+                logger.info(f"正在发送邮件，大小: {len(text)} 字节")
                 server.sendmail(self.sender_email, self.receiver_emails, text)
                 server.quit()
                 
-                logger.info(f"邮件发送成功！收件人: {', '.join(self.receiver_emails)}")
+                logger.info(f"✅ 邮件发送成功！收件人: {', '.join(self.receiver_emails)}")
                 return True
                 
+            except smtplib.SMTPAuthenticationError as e:
+                logger.error(f"❌ 认证失败: {e}")
+                logger.error("请检查QQ邮箱和授权码是否正确")
+                break  # 认证失败不重试
             except Exception as e:
-                logger.error(f"发送邮件失败 (第{attempt + 1}次): {e}")
+                logger.error(f"❌ 发送邮件失败 (第{attempt + 1}次): {e}")
+                logger.error(f"错误类型: {type(e).__name__}")
                 if attempt < retry_times - 1:
                     time.sleep(10)  # 等待10秒后重试
                     
