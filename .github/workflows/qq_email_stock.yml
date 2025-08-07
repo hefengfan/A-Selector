@@ -40,12 +40,14 @@ jobs:
         python 最终正确选股系统.py
     
     - name: 使用QQ邮箱发送通知
-      if: github.event_name == 'schedule' || github.event.inputs.send_email == 'true'
       env:
         QQ_EMAIL_SENDER: ${{ secrets.QQ_EMAIL_SENDER }}
         QQ_EMAIL_PASSWORD: ${{ secrets.QQ_EMAIL_PASSWORD }}
         QQ_EMAIL_RECEIVERS: ${{ secrets.QQ_EMAIL_RECEIVERS }}
       run: |
+        echo "开始发送邮件..."
+        echo "发件人: $QQ_EMAIL_SENDER"
+        echo "收件人: $QQ_EMAIL_RECEIVERS"
         python qq_stock_email.py
     
     - name: 上传选股结果

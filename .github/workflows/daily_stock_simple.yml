@@ -1,0 +1,65 @@
+name: 每日A股选股（简化版）
+
+on:
+  schedule:
+    # 北京时间每天15:30运行（UTC时间07:30）
+    - cron: '30 7 * * 1-5'
+  
+  workflow_dispatch:
+
+jobs:
+  stock-selection:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+    
+    - name: 设置Python环境
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.9'
+    
+    - name: 安装依赖
+      run: |
+        python -m pip install --upgrade pip
+        pip install akshare pandas numpy
+    
+    - name: 运行选股系统
+      run: |
+        python 最终正确选股系统.py
+    
+    - name: 创建Issue通知
+      if: success()
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const date = new Date().toISOString().split('T')[0];
+          
+          // 读取选股结果
+          let content = '# 📈 今日选股结果\n\n';
+          try {
+            const stockData = fs.readFileSync('输出数据/优质股票.txt', 'utf8');
+            content += '```\n' + stockData + '\n```\n';
+          } catch (e) {
+            content += '无法读取选股结果文件\n';
+          }
+          
+          // 创建Issue
+          await github.rest.issues.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: `【选股结果】${date}`,
+            body: content,
+            labels: ['选股结果', 'auto-generated']
+          });
+    
+    - name: 上传选股结果
+      uses: actions/upload-artifact@v4
+      with:
+        name: stock-results-${{ github.run_number }}
+        path: |
+          输出数据/优质股票.txt
+          输出数据/A股数据.csv
+        retention-days: 30
