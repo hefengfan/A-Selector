@@ -1,43 +1,53 @@
-# 📈 A股自动化选股系统
+# A股自动化选股系统
 
-每日自动筛选优质A股，通过邮件发送选股结果。
+## 系统功能
+每天自动运行选股系统，筛选优质A股股票，并通过QQ邮箱发送通知。
 
-## 🚀 快速开始
+## 核心文件（仅保留以下文件）
 
-### 方式1：GitHub云端自动化（推荐）
+### 1. 最终正确选股系统.py
+- 主要选股逻辑
+- 基于苏氏量化策略筛选12只优质股票
+- 输出到 `输出数据/优质股票.txt`
+
+### 2. qq_stock_email.py  
+- QQ邮箱发送模块
+- 读取选股结果并发送邮件通知
+- 支持多个收件人
+
+### 3. .github/workflows/qq_email_stock.yml
+- GitHub Actions工作流配置
+- 每天15:30自动运行（北京时间）
+- 自动执行选股并发送邮件
+
+## 使用说明
+
+### 配置GitHub Secrets（必须）
+在GitHub仓库设置中添加以下Secrets：
+- `QQ_EMAIL_SENDER`: rofanyou@qq.com
+- `QQ_EMAIL_PASSWORD`: wzvecdxffpeqbdig
+- `QQ_EMAIL_RECEIVERS`: rofanyou@qq.com
+
+### 手动运行
 ```bash
-bash GitHub一键部署.sh
+# 本地运行选股
+python 最终正确选股系统.py
+
+# 发送邮件（需设置环境变量）
+python qq_stock_email.py
 ```
-- ✅ 不需要电脑开机
-- ✅ 完全免费
-- ✅ 每天15:30自动执行
 
-### 方式2：手动执行
-- 双击 `发送选股邮件.command` - 立即发送
-- 双击 `仅选股不发邮件.command` - 只看结果
-- 运行 `python3 快速选股.py` - 交互式菜单
+### GitHub Actions自动运行
+- 每天北京时间15:30自动执行
+- 可在Actions页面手动触发
+- 运行结果会通过邮件发送
 
-## 📊 选股策略
+## 输出文件
+- `输出数据/优质股票.txt` - 选股结果
+- `输出数据/A股数据.csv` - 完整数据
+- `logs/` - 运行日志
 
-基于苏氏量化策略，筛选优质率≥2110的股票，每日固定输出12只优质股票。
-
-## 📧 邮件配置
-
-使用Gmail发送，支持发送到QQ邮箱、163邮箱等任何邮箱。
-
-## 📁 文件说明
-
-- `最终正确选股系统.py` - 核心选股程序
-- `auto_stock_email.py` - 邮件发送程序
-- `GitHub一键部署.sh` - 自动部署脚本
-- `输出数据/` - 选股结果
-
-## 🔧 技术栈
-
-- Python 3.9+
-- AKShare (数据源)
-- GitHub Actions (自动化)
-
-## 📝 License
-
-Private Project - 仅供个人使用
+## 注意事项
+- QQ邮箱需要开启SMTP服务
+- GitHub Secrets必须正确配置
+- 选股仅供参考，不构成投资建议
