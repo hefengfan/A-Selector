@@ -1,0 +1,58 @@
+name: 每日A股选股 - QQ邮箱版
+
+on:
+  schedule:
+    # 北京时间每天15:30运行（UTC时间07:30）
+    - cron: '30 7 * * 1-5'  # 周一到周五
+  
+  # 允许手动触发
+  workflow_dispatch:
+    inputs:
+      send_email:
+        description: '是否发送邮件'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+jobs:
+  stock-selection:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+    
+    - name: 设置Python环境
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.9'
+    
+    - name: 安装依赖
+      run: |
+        python -m pip install --upgrade pip
+        pip install akshare pandas numpy
+    
+    - name: 运行选股系统
+      run: |
+        python 最终正确选股系统.py
+    
+    - name: 使用QQ邮箱发送通知
+      if: github.event_name == 'schedule' || github.event.inputs.send_email == 'true'
+      env:
+        QQ_EMAIL_SENDER: ${{ secrets.QQ_EMAIL_SENDER }}
+        QQ_EMAIL_PASSWORD: ${{ secrets.QQ_EMAIL_PASSWORD }}
+        QQ_EMAIL_RECEIVERS: ${{ secrets.QQ_EMAIL_RECEIVERS }}
+      run: |
+        python qq_stock_email.py
+    
+    - name: 上传选股结果
+      uses: actions/upload-artifact@v4
+      with:
+        name: stock-results-${{ github.run_number }}
+        path: |
+          输出数据/优质股票.txt
+          输出数据/A股数据.csv
+        retention-days: 30
