@@ -185,11 +185,11 @@ def train_neural_network(df):
 
     # 计算复合质量评分 (可以调整权重)
     df['quality_score'] = (
-        0.3 * change_norm +  # 涨幅
-        0.25 * profit_norm +  # 净利润
+        0.4 * change_norm +  # 涨幅 (权重增加)
+        0.2 * profit_norm +  # 净利润 (权重略微降低)
         0.15 * (1 - abs(turnover_norm - 0.5)) +  # 换手率 (适中最好)
-        0.2 * market_cap_norm +  # 市值
-        0.1 * (1 - pe_ratio_norm)  # 市盈率 (越低越好)
+        0.15 * market_cap_norm +  # 市值 (权重略微降低)
+        0.1 * (1 - pe_ratio_norm)  # 市盈率 (越低越好) (权重略微降低)
     )
 
     y = df['quality_score'].values
@@ -330,7 +330,7 @@ def perform_association_rule_mining(df):
 
         # 目标变量：高涨幅 (例如，涨幅 > 2%)
         change = safe_float(row.get('涨幅%'))
-        if pd.notna(change) and change > 2.0: # 可以调整这个阈值
+        if pd.notna(change) and change > 1.0:  # 降低高涨幅阈值
             items.append("高涨幅")
         else:
             items.append("低涨幅")
@@ -347,7 +347,7 @@ def perform_association_rule_mining(df):
 
     # 查找频繁项集
     # min_support 可以根据数据量调整，太小规则太多，太大规则太少
-    frequent_itemsets = apriori(df_ar, min_support=0.01, use_colnames=True)
+    frequent_itemsets = apriori(df_ar, min_support=0.005, use_colnames=True) # 调整min_support
     if frequent_itemsets.empty:
         print("   ⚠️ 未找到频繁项集，请尝试降低 min_support。")
         return
@@ -355,7 +355,7 @@ def perform_association_rule_mining(df):
     # 生成关联规则
     # min_confidence 越高，规则越可靠
     # lift > 1 表示前件和后件正相关
-    rules = association_rules(frequent_itemsets, metric="lift", min_threshold=1.1)
+    rules = association_rules(frequent_itemsets, metric="lift", min_threshold=1.0) # 调整min_threshold
 
     if rules.empty:
         print("   ⚠️ 未找到有意义的关联规则，请尝试降低 min_threshold 或检查数据。")
@@ -574,7 +574,7 @@ def main():
             f.write(f"市盈率(动): {stock['市盈率(动)']:.2f}\n")
             f.write("-"*30 + "\n")
 
-    print(f"\n✅ 优质股票已保存: {output_file2}")
+        print(f"\n✅ 优质股票已保存: {output_file2}")
     print(f"   找到 {len(quality_stocks_filtered)} 只优质股票（最低优质率={threshold:.4f}）")
 
     if len(quality_stocks_filtered) > 0:
@@ -623,11 +623,14 @@ def main():
             # 投资建议
             if quality_score > 0.8 and momentum == "强" and rule_signal == "积极":
                 if market_cap < 500:
-                    print("     建议: (短期)可考虑少量买入，关注后续走势。")
+                    print("     建议: (短线)可考虑少量买入，设置5%止损。") # 短线交易，设置止损
                 else:
-                    print("     建议: (长期)基本面良好，可作为长期投资标的。")
+                    if pe_ratio < 50: # 容忍更高的市盈率
+                        print("     建议: (中长线)成长性较好，可作为中长期投资标的。")
+                    else:
+                        print("     建议: 谨慎买入，关注后续财报数据。")
             elif quality_score > 0.6 and momentum == "强":
-                print("     建议: (中期)可关注，但需谨慎，注意风险控制。")
+                print("     建议: (短线)可关注，但需谨慎，快进快出。") # 短线交易
             else:
                 print("     建议: 暂不建议买入，继续观察。")
 
@@ -651,3 +654,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
