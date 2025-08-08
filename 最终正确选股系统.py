@@ -13,6 +13,7 @@
 6. 引入更多技术和财务指标作为模型特征。
 7. 根据模型评分和规则生成明确的“短期买入”、“长期买入”和“规避”策略信号。
 8. 提供模型特征重要性评估。
+9. 策略推荐给出多特征组合，更具指导性。
 """
 
 import akshare as ak
@@ -82,12 +83,12 @@ def get_model_features(row):
         f_condition = 1
     elif pd.notna(current) and pd.notna(ma20) and ma20 > 0 and 0.90 <= current / ma20 <= 1.10:
         f_condition = 1
-    features.append(f_condition) # Feature 0
+    features.append(f_condition) # Feature 0: F_价格位置
 
     # G列：涨幅和价格位置
     change = safe_float(row.get('涨幅%'))
     high = safe_float(row.get('最高'))
-    low = safe_float(row.get('最低'))
+    # low = safe_float(row.get('最低')) # low已在上面获取
 
     g_condition = 0
     if pd.notna(change) and change >= 5.0 and pd.notna(current) and pd.notna(high) and pd.notna(low):
@@ -95,43 +96,43 @@ def get_model_features(row):
             threshold = high - (high - low) * 0.30
             if current >= threshold:
                 g_condition = 1
-        elif current == high:
+        elif current == high: # 如果最高最低相同，且涨幅>=5，也算满足
             g_condition = 1
-    features.append(g_condition) # Feature 1
+    features.append(g_condition) # Feature 1: G_涨幅位置
 
     # 更多技术指标特征 (数值)
     # 价格相对均线位置
-    features.append(current / ma20 if pd.notna(current) and pd.notna(ma20) and ma20 > 0 else 1.0) # Feature 2
-    features.append(current / ma60 if pd.notna(current) and pd.notna(ma60) and ma60 > 0 else 1.0) # Feature 3
-    features.append(ma20 / ma60 if pd.notna(ma20) and pd.notna(ma60) and ma60 > 0 else 1.0) # Feature 4
+    features.append(current / ma20 if pd.notna(current) and pd.notna(ma20) and ma20 > 0 else 1.0) # Feature 2: 价格_vs_MA20
+    features.append(current / ma60 if pd.notna(current) and pd.notna(ma60) and ma60 > 0 else 1.0) # Feature 3: 价格_vs_MA60
+    features.append(ma20 / ma60 if pd.notna(ma20) and pd.notna(ma60) and ma60 > 0 else 1.0) # Feature 4: MA20_vs_MA60
 
     # 每日波动幅度
     daily_range_ratio = (high - low) / current if pd.notna(high) and pd.notna(low) and pd.notna(current) and current > 0 else 0.0
-    features.append(daily_range_ratio) # Feature 5
+    features.append(daily_range_ratio) # Feature 5: 日内波动率
 
     # 收盘价在日内区间的位置 (越接近最高价越强)
     close_pos_in_range = (current - low) / (high - low) if pd.notna(current) and pd.notna(low) and pd.notna(high) and (high - low) > 0 else 0.5
-    features.append(close_pos_in_range) # Feature 6
+    features.append(close_pos_in_range) # Feature 6: 收盘价_日内位置
 
     # 财务与市场指标特征 (数值)
     profit = safe_float(row.get('归属净利润')) # 单位是亿，这里保持原值
-    features.append(profit if pd.notna(profit) else 0) # Feature 7
+    features.append(profit if pd.notna(profit) else 0) # Feature 7: 归属净利润
 
     turnover = safe_float(row.get('实际换手%'))
-    features.append(turnover if pd.notna(turnover) else 0) # Feature 8
+    features.append(turnover if pd.notna(turnover) else 0) # Feature 8: 实际换手率
 
     market_cap = safe_float(row.get('总市值')) # 单位是亿，这里保持原值
-    features.append(market_cap if pd.notna(market_cap) else 0) # Feature 9
+    features.append(market_cap if pd.notna(market_cap) else 0) # Feature 9: 总市值
 
     pe_ratio = safe_float(row.get('市盈率(动)'))
-    features.append(pe_ratio if pd.notna(pe_ratio) else 1000) # Feature 10 (缺失时给一个大值，表示高估)
+    features.append(pe_ratio if pd.notna(pe_ratio) else 1000) # Feature 10: 市盈率(动) (缺失时给一个大值，表示高估)
 
-    # 成交额 (单位是元，akshare返回的是亿)
+    # 成交额 (单位是亿)
     turnover_value = safe_float(row.get('成交额')) # akshare返回的是亿，这里保持原值
-    features.append(turnover_value if pd.notna(turnover_value) else 0) # Feature 11
+    features.append(turnover_value if pd.notna(turnover_value) else 0) # Feature 11: 成交额
 
     # 涨幅%
-    features.append(change if pd.notna(change) else 0) # Feature 12
+    features.append(change if pd.notna(change) else 0) # Feature 12: 涨幅%
 
     return features
 
@@ -300,7 +301,7 @@ def train_xgboost_model(df):
     print(f"   最终模型均方误差 (MSE): {mse:.4f}")
     print(f"   最终模型R²分数: {r2:.4f}")
 
-    # 获取特征名称
+    # 获取特征名称 (与get_model_features中的顺序一致)
     feature_names = [
         "F_价格位置", "G_涨幅位置", "价格_vs_MA20", "价格_vs_MA60", "MA20_vs_MA60",
         "日内波动率", "收盘价_日内位置", "归属净利润", "实际换手率", "总市值", "市盈率(动)",
@@ -341,52 +342,62 @@ def generate_strategy_signals(stock_data, nn_score):
     market_cap = safe_float(stock_data.get('总市值'))
     high = safe_float(stock_data.get('最高'))
     low = safe_float(stock_data.get('最低'))
+    成交额 = safe_float(stock_data.get('成交额'))
 
-    # 短期买入信号
+    # 短期买入信号条件列表
     short_term_buy_conditions = []
-    if pd.notna(nn_score) and nn_score > 0.7: # 较高评分
-        short_term_buy_conditions.append("NN高分")
-    if pd.notna(change) and change > 2.0: # 积极涨幅
-        short_term_buy_conditions.append("涨幅积极")
-    if pd.notna(current) and pd.notna(ma20) and ma20 > 0 and current > ma20 * 1.01: # 站上20日均线
-        short_term_buy_conditions.append("站上20MA")
-    if pd.notna(turnover) and 1.0 < turnover < 15.0: # 适中换手率
-        short_term_buy_conditions.append("换手适中")
-    if pd.notna(current) and pd.notna(high) and pd.notna(low) and (high - low) > 0 and (current - low) / (high - low) > 0.7: # 收盘价接近日内高点
-        short_term_buy_conditions.append("收盘强势")
-
+    if pd.notna(nn_score) and nn_score > 0.7:
+        short_term_buy_conditions.append("NN高分(>0.7)")
+    if pd.notna(change) and change >= 2.0:
+        short_term_buy_conditions.append(f"涨幅积极(>={change:.2f}%)")
+    if pd.notna(current) and pd.notna(ma20) and ma20 > 0 and current > ma20 * 1.01:
+        short_term_buy_conditions.append("站上20MA(>1.01倍)")
+    if pd.notna(turnover) and 1.0 < turnover < 15.0:
+        short_term_buy_conditions.append(f"换手适中({turnover:.2f}%)")
+    if pd.notna(current) and pd.notna(high) and pd.notna(low) and (high - low) > 0 and (current - low) / (high - low) > 0.7:
+        short_term_buy_conditions.append("收盘强势(近高点)")
+    if pd.notna(成交额) and 成交额 > 5.0: # 成交额大于5亿
+        short_term_buy_conditions.append(f"成交活跃(>{成交额:.2f}亿)")
+    
+    # 判断短期买入信号
     if len(short_term_buy_conditions) >= 3: # 满足至少3个条件
         signals.append(f"短期买入 ({', '.join(short_term_buy_conditions)})")
 
-    # 长期买入信号
+    # 长期买入信号条件列表
     long_term_buy_conditions = []
-    if pd.notna(nn_score) and nn_score > 0.6: # 中等偏高评分
-        long_term_buy_conditions.append("NN中高分")
-    if pd.notna(pe_ratio) and 0 < pe_ratio < 40: # 合理市盈率
-        long_term_buy_conditions.append("PE合理")
+    if pd.notna(nn_score) and nn_score > 0.6:
+        long_term_buy_conditions.append("NN中高分(>0.6)")
+    if pd.notna(pe_ratio) and 0 < pe_ratio < 40:
+        long_term_buy_conditions.append(f"PE合理({pe_ratio:.2f})")
     if pd.notna(profit) and profit > 0.5: # 归属净利润大于5000万 (0.5亿)
-        long_term_buy_conditions.append("净利润良好")
+        long_term_buy_conditions.append(f"净利润良好(>{profit:.2f}亿)")
     if pd.notna(market_cap) and market_cap > 100: # 总市值大于100亿
-        long_term_buy_conditions.append("市值较大")
-    if pd.notna(current) and pd.notna(ma60) and ma60 > 0 and current > ma60 * 0.95: # 价格在60日均线附近或之上
-        long_term_buy_conditions.append("价格近60MA")
+        long_term_buy_conditions.append(f"市值较大(>{market_cap:.2f}亿)")
+    if pd.notna(current) and pd.notna(ma60) and ma60 > 0 and current > ma60 * 0.95:
+        long_term_buy_conditions.append("价格近60MA(>0.95倍)")
+    if pd.notna(ma20) and pd.notna(ma60) and ma60 > 0 and ma20 > ma60: # 20日均线在60日均线之上
+        long_term_buy_conditions.append("均线多头排列(20MA>60MA)")
 
+    # 判断长期买入信号
     if len(long_term_buy_conditions) >= 3: # 满足至少3个条件
         signals.append(f"长期买入 ({', '.join(long_term_buy_conditions)})")
 
-    # 规避/警示信号
+    # 规避/警示信号条件列表
     avoid_conditions = []
-    if pd.notna(change) and change < -5.0: # 大幅下跌
-        avoid_conditions.append("大幅下跌")
-    if pd.notna(turnover) and turnover > 25.0: # 换手率过高 (可能见顶)
-        avoid_conditions.append("换手过高")
-    if pd.notna(pe_ratio) and (pe_ratio < 0 or pe_ratio > 150): # 市盈率异常
-        avoid_conditions.append("PE异常")
-    if pd.notna(profit) and profit < 0: # 净利润为负
-        avoid_conditions.append("净利润为负")
-    if pd.notna(current) and pd.notna(ma20) and ma20 > 0 and current < ma20 * 0.95: # 跌破20日均线
-        avoid_conditions.append("跌破20MA")
+    if pd.notna(change) and change < -5.0:
+        avoid_conditions.append(f"大幅下跌(<{change:.2f}%)")
+    if pd.notna(turnover) and turnover > 25.0:
+        avoid_conditions.append(f"换手过高(>{turnover:.2f}%)")
+    if pd.notna(pe_ratio) and (pe_ratio < 0 or pe_ratio > 150):
+        avoid_conditions.append(f"PE异常({pe_ratio:.2f})")
+    if pd.notna(profit) and profit < 0:
+        avoid_conditions.append(f"净利润为负({profit:.2f}亿)")
+    if pd.notna(current) and pd.notna(ma20) and ma20 > 0 and current < ma20 * 0.95:
+        avoid_conditions.append("跌破20MA(<0.95倍)")
+    if pd.notna(market_cap) and market_cap < 30: # 总市值小于30亿
+        avoid_conditions.append(f"市值过小(<{market_cap:.2f}亿)")
 
+    # 判断规避/警示信号
     if len(avoid_conditions) >= 2: # 满足至少2个条件
         signals.append(f"规避/警示 ({', '.join(avoid_conditions)})")
 
@@ -409,11 +420,11 @@ def perform_association_rule_mining(df):
         items = []
 
         # 将数值特征转换为二值化条件
-        # F列：价格位置条件
+        # F列：价格位置条件 (Feature 0)
         if raw_features[0] == 1: items.append("F_价格位置_满足")
         else: items.append("F_价格位置_不满足")
 
-        # G列：涨幅和价格位置
+        # G列：涨幅和价格位置 (Feature 1)
         if raw_features[1] == 1: items.append("G_涨幅位置_满足")
         else: items.append("G_涨幅位置_不满足")
 
@@ -710,11 +721,11 @@ def main():
 
     if len(buy_signals_stocks) > 0:
         print(f"\n🎯 今日优质股票列表 (前{len(buy_signals_stocks)}名，仅显示买入信号)：")
-        print("="*80)
-        print(f"{'股票代码':<10} {'股票名称':<12} {'涨幅':<8} {'优质率':<10} {'所属行业':<15} {'策略信号':<20}")
-        print("-"*80)
+        print("="*100)
+        print(f"{'股票代码':<10} {'股票名称':<12} {'涨幅':<8} {'优质率':<10} {'所属行业':<15} {'策略信号':<40}")
+        print("-"*100)
         for stock in buy_signals_stocks:
-            print(f"{stock['代码']:<10} {stock['名称']:<12} {stock['涨幅']:<8} {stock['优质率']:.4f}   {stock['行业']:<15} {stock['策略信号']:<20}")
+            print(f"{stock['代码']:<10} {stock['名称']:<12} {stock['涨幅']:<8} {stock['优质率']:.4f}   {stock['行业']:<15} {stock['策略信号']:<40}")
     else:
         print("\n⚠️ 今日没有找到符合买入条件的优质股票")
         print("   可能原因：")
