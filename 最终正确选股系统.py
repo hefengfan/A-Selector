@@ -132,22 +132,24 @@ def create_model(trial, input_shape):
     """
     使用 Optuna 建议的超参数创建 Scikit-learn MLPRegressor 模型
     """
-    n_layers = trial.suggest_int('n_layers', 1, 3)
+    n_layers = trial.suggest_int('n_layers', 1, 4)  # 增加层数
     hidden_layer_sizes = []
     for i in range(n_layers):
-        num_units = trial.suggest_int(f'n_units_{i}', 32, 256)
+        num_units = trial.suggest_int(f'n_units_{i}', 64, 512)  # 增加节点数
         hidden_layer_sizes.append(num_units)
 
-    activation = trial.suggest_categorical('activation', ['relu', 'tanh', 'logistic'])
+    activation = trial.suggest_categorical('activation', ['relu', 'tanh', 'logistic', 'identity']) # 增加激活函数
     solver = trial.suggest_categorical('solver', ['adam', 'lbfgs']) # 移除 'sgd'，lbfgs 不需要 learning_rate
-    alpha = trial.suggest_float('alpha', 1e-5, 1e-2, log=True)
+    alpha = trial.suggest_float('alpha', 1e-6, 1e-1, log=True)  # 调整 alpha 范围
+    learning_rate_init = trial.suggest_float('learning_rate_init', 1e-4, 1e-2, log=True) # 调整学习率
 
     model = MLPRegressor(hidden_layer_sizes=hidden_layer_sizes,
                          activation=activation,
                          solver=solver,
                          alpha=alpha,
+                         learning_rate_init=learning_rate_init,
                          random_state=42,
-                         max_iter=200,  # 限制迭代次数
+                         max_iter=300,  # 限制迭代次数
                          early_stopping=True) # 启用早停
 
     return model
@@ -161,7 +163,13 @@ def objective(trial, X_train, y_train, X_test, y_test):
     model.fit(X_train, y_train)
     y_pred = model.predict(X_test)
     mse = mean_squared_error(y_test, y_pred)
-    return mse
+
+    #  添加 R^2 作为辅助评估指标
+    r2 = r2_score(y_test, y_pred)
+
+    #  综合 MSE 和 R^2，鼓励两者都表现良好
+    #  可以根据实际情况调整权重
+    return mse - r2 * 0.1  # 最小化 MSE，同时最大化 R^2
 
 
 def train_neural_network(df):
@@ -216,7 +224,7 @@ def train_neural_network(df):
     from functools import partial
     objective_partial = partial(objective, X_train=X_train, y_train=y_train, X_test=X_test, y_test=y_test)
 
-    study.optimize(objective_partial, n_trials=10, timeout=60)  # 限制时间和 trials
+    study.optimize(objective_partial, n_trials=20, timeout=120)  # 限制时间和 trials，增加 trials 和 timeout
 
     # 5. 使用最佳超参数创建模型
     print("   使用最佳超参数创建模型...")
@@ -261,6 +269,9 @@ def analyze_association_rules(df):
 
     # 将特征转换为布尔值 (0 或 1)
     df_encoded = df.applymap(lambda x: 1 if isinstance(x, (int, float)) and x > 0 else 0)
+
+    # 转换为布尔类型 DataFrame
+    df_encoded = df_encoded.astype(bool)
 
     # 使用 Apriori 算法找到频繁项集
     frequent_itemsets = apriori(df_encoded, min_support=0.05, use_colnames=True)  # 调整 min_support
@@ -382,8 +393,13 @@ def main():
 
     # 保存A股数据
     output_file1 = '输出数据/A股数据.csv'
-    final_df.to_csv(output_file1, index=False, encoding='utf-8-sig')
-    print(f"\n✅ A股数据已保存: {output_file1}")
+    try:
+        final_df.to_csv(output_file1, index=False, encoding='utf-8-sig')
+        print(f"\n✅ A股数据已保存: {output_file1}")
+    except Exception as e:
+        print(f"\n❌ 无法保存 A 股数据: {e}")
+        print(f"   错误信息: {e}")
+
     print(f"   共 {len(final_df)} 只股票")
 
     # ========== 第二步：训练神经网络 ==========
@@ -427,7 +443,7 @@ def main():
         score_rules = 0.0  # 初始关联规则评分
 
         #  示例：如果股票满足某些关联规则，则增加评分
-        #  你需要根据你的 rules 对象来编写具体的规则判断逻辑
+        #  你需要根据你的关联规则分析结果来设计具体的规则判断逻辑
         # for rule in rules:
         #     if row['所属行业'] in rule.antecedents and row['涨幅%'] in rule.consequents:
         #         score_rules += rule.confidence  # 使用置信度作为加权
@@ -487,26 +503,31 @@ def main():
 
     # 保存优质股票
     output_file2 = '输出数据/优质股票.txt'
-    with open(output_file2, 'w', encoding='utf-8') as f:
-        f.write("苏氏量化策略 - 优质股票筛选结果 (Scikit-learn + Optuna 神经网络评分 + Apriori 关联规则)\n")
-        f.write(f"筛选时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"模型最终评分: {final_model_score:.4f}\n")  # 显示模型最终评分
-        f.write(f"神经网络 R^2: {r2_score_nn:.4f}\n")  # 显示神经网络的 R^2
-        f.write(f"关联规则数量: {len(rules)}\n")  # 显示关联规则数量
-        f.write(f"筛选阈值: {threshold:.4f}\n")  # 显示神经网络的阈值
-        f.write(f"优质股票数量: {len(quality_stocks)}\n")
-        f.write("=" * 50 + "\n\n")
+    try:
+        with open(output_file2, 'w', encoding='utf-8') as f:
+            f.write("苏氏量化策略 - 优质股票筛选结果 (Scikit-learn + Optuna 神经网络评分 + Apriori 关联规则)\n")
+            f.write(f"筛选时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"模型最终评分: {final_model_score:.4f}\n")  # 显示模型最终评分
+            f.write(f"神经网络 R^2: {r2_score_nn:.4f}\n")  # 显示神经网络的 R^2
+            f.write(f"关联规则数量: {len(rules)}\n")  # 显示关联规则数量
+            f.write(f"筛选阈值: {threshold:.4f}\n")  # 显示神经网络的阈值
+            f.write(f"优质股票数量: {len(quality_stocks)}\n")
+            f.write("=" * 50 + "\n\n")
 
-        for stock in quality_stocks:
-            f.write(f"股票代码: {stock['代码']}\n")
-            f.write(f"股票名称: {stock['名称']}\n")
-            f.write(f"所属行业: {stock['行业']}\n")
-            f.write(f"优质率: {stock['优质率']:.4f}\n")  # 显示神经网络的评分
-            f.write(f"满足条件: {stock['满足条件']}\n")
-            f.write(f"今日涨幅: {stock['涨幅']}\n")
-            f.write("-" * 30 + "\n")
+            for stock in quality_stocks:
+                f.write(f"股票代码: {stock['代码']}\n")
+                f.write(f"股票名称: {stock['名称']}\n")
+                f.write(f"所属行业: {stock['行业']}\n")
+                f.write(f"优质率: {stock['优质率']:.4f}\n")  # 显示神经网络的评分
+                f.write(f"满足条件: {stock['满足条件']}\n")
+                f.write(f"今日涨幅: {stock['涨幅']}\n")
+                f.write("-" * 30 + "\n")
 
-    print(f"\n✅ 优质股票已保存: {output_file2}")
+        print(f"\n✅ 优质股票已保存: {output_file2}")
+    except Exception as e:
+        print(f"\n❌ 无法保存优质股票: {e}")
+        print(f"   错误信息: {e}")
+
     print(f"   找到 {len(quality_stocks)} 只优质股票（阈值={threshold:.4f}）")  # 显示神经网络的阈值
 
     if len(quality_stocks) > 0:
@@ -525,8 +546,12 @@ def main():
 
     # 将包含神经网络评分的 DataFrame 保存到 CSV
     output_file1 = '输出数据/A股数据.csv'
-    final_df.to_csv(output_file1, index=False, encoding='utf-8-sig')
-    print(f"\n✅ 包含神经网络评分的 A 股数据已保存: {output_file1}")
+    try:
+        final_df.to_csv(output_file1, index=False, encoding='utf-8-sig')
+        print(f"\n✅ 包含神经网络评分的 A 股数据已保存: {output_file1}")
+    except Exception as e:
+        print(f"\n❌ 无法保存包含神经网络评分的 A 股数据: {e}")
+        print(f"   错误信息: {e}")
 
     print("\n" + "=" * 60)
     print("✅ 程序执行完成！")
