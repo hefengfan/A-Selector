@@ -3,7 +3,8 @@
 """
 动态选股系统 - 根据每天实时数据筛选
 基于苏氏量化策略的真实计算逻辑
-集成神经网络进行精准评分 (TensorFlow + Optuna)
+集成神经网络进行精准评分 (Scikit-learn + Optuna)
+集成关联规则挖掘 (Apriori)
 """
 
 import akshare as ak
@@ -14,12 +15,15 @@ import os
 import warnings
 warnings.filterwarnings('ignore')
 
-# 导入 TensorFlow 和 Optuna 相关库
-import tensorflow as tf
+# 导入 Scikit-learn 和 Optuna 相关库
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+from sklearn.neural_network import MLPRegressor
 from sklearn.metrics import mean_squared_error, r2_score
 import optuna
+
+# 导入关联规则挖掘库
+from mlxtend.frequent_patterns import apriori, association_rules
 
 # 清除代理设置
 os.environ['HTTP_PROXY'] = ''
@@ -126,20 +130,26 @@ def calculate_features(row):
 
 def create_model(trial, input_shape):
     """
-    使用 Optuna 建议的超参数创建 TensorFlow 神经网络模型
+    使用 Optuna 建议的超参数创建 Scikit-learn MLPRegressor 模型
     """
-    n_layers = trial.suggest_int('n_layers', 1, 3)  # 建议层数
-    model = tf.keras.models.Sequential()
-    model.add(tf.keras.layers.Input(shape=input_shape))
-
+    n_layers = trial.suggest_int('n_layers', 1, 3)
+    hidden_layer_sizes = []
     for i in range(n_layers):
-        num_units = trial.suggest_int(f'n_units_{i}', 32, 256)  # 建议神经元数量
-        activation = trial.suggest_categorical(f'activation_{i}', ['relu', 'tanh', 'sigmoid'])  # 建议激活函数
-        model.add(tf.keras.layers.Dense(num_units, activation=activation))
-        dropout_rate = trial.suggest_float(f'dropout_{i}', 0.0, 0.5)  # 建议 Dropout 率
-        model.add(tf.keras.layers.Dropout(dropout_rate))
+        num_units = trial.suggest_int(f'n_units_{i}', 32, 256)
+        hidden_layer_sizes.append(num_units)
 
-    model.add(tf.keras.layers.Dense(1))  # 输出层
+    activation = trial.suggest_categorical('activation', ['relu', 'tanh', 'logistic'])
+    solver = trial.suggest_categorical('solver', ['adam', 'lbfgs']) # 移除 'sgd'，lbfgs 不需要 learning_rate
+    alpha = trial.suggest_float('alpha', 1e-5, 1e-2, log=True)
+
+    model = MLPRegressor(hidden_layer_sizes=hidden_layer_sizes,
+                         activation=activation,
+                         solver=solver,
+                         alpha=alpha,
+                         random_state=42,
+                         max_iter=200,  # 限制迭代次数
+                         early_stopping=True) # 启用早停
+
     return model
 
 
@@ -147,24 +157,16 @@ def objective(trial, X_train, y_train, X_test, y_test):
     """
     Optuna 优化的目标函数
     """
-    model = create_model(trial, (X_train.shape[1],))
-    optimizer = trial.suggest_categorical('optimizer', ['adam', 'rmsprop', 'sgd'])  # 建议优化器
-    learning_rate = trial.suggest_float('learning_rate', 1e-5, 1e-2, log=True)  # 建议学习率
-
-    model.compile(optimizer=optimizer, loss='mse', metrics=['mse'])
-
-    # 添加 EarlyStopping 回调
-    early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-
-    history = model.fit(X_train, y_train, epochs=50, batch_size=32, validation_split=0.1, callbacks=[early_stopping], verbose=0)
-
-    _, mse = model.evaluate(X_test, y_test, verbose=0)
+    model = create_model(trial, X_train.shape[1])
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+    mse = mean_squared_error(y_test, y_pred)
     return mse
 
 
 def train_neural_network(df):
     """
-    训练神经网络模型 (TensorFlow + Optuna)，预测股票评分
+    训练神经网络模型 (Scikit-learn + Optuna)，预测股票评分
     """
 
     # 1. 准备训练数据
@@ -209,21 +211,21 @@ def train_neural_network(df):
     # 4. 使用 Optuna 优化超参数
     print("   使用 Optuna 优化超参数...")
     study = optuna.create_study(direction='minimize')
-    study.optimize(lambda trial: objective(trial, X_train, y_train, X_test, y_test), n_trials=10)  # 调整 trials 数量
+
+    # 使用 partial 减少 objective 函数的重复代码
+    from functools import partial
+    objective_partial = partial(objective, X_train=X_train, y_train=y_train, X_test=X_test, y_test=y_test)
+
+    study.optimize(objective_partial, n_trials=10, timeout=60)  # 限制时间和 trials
 
     # 5. 使用最佳超参数创建模型
     print("   使用最佳超参数创建模型...")
-    best_model = create_model(study.best_trial, (X_train.shape[1],))
-    best_model.compile(optimizer=study.best_params['optimizer'], loss='mse', metrics=['mse'])
+    best_model = create_model(study.best_trial, X_train.shape[1])
+    best_model.fit(X_train, y_train)
 
-    # 6. 训练最佳模型
-    print("   训练最佳模型...")
-    early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-    best_model.fit(X_train, y_train, epochs=50, batch_size=32, validation_split=0.1, callbacks=[early_stopping], verbose=0)
-
-    # 7. 评估最佳模型
+    # 6. 评估最佳模型
     print("   评估最佳模型...")
-    y_pred = best_model.predict(X_test, verbose=0)
+    y_pred = best_model.predict(X_test)
     mse = mean_squared_error(y_test, y_pred)
     r2 = r2_score(y_test, y_pred)
     print(f"   均方误差 (MSE): {mse:.4f}")
@@ -237,7 +239,7 @@ def train_neural_network(df):
 
 def predict_score_with_nn(row, model, scaler):
     """
-    使用训练好的 TensorFlow 神经网络模型预测股票评分
+    使用训练好的 Scikit-learn 神经网络模型预测股票评分
     """
     features = calculate_features(row)
     features = np.array(features).reshape(1, -1)  # 转换为二维数组
@@ -247,15 +249,35 @@ def predict_score_with_nn(row, model, scaler):
         return 0  # 如果有，返回一个默认值
 
     features_scaled = scaler.transform(features)
-    score = model.predict(features_scaled, verbose=0)[0][0]
+    score = model.predict(features_scaled)[0]
     return score
+
+
+def analyze_association_rules(df):
+    """
+    使用 Apriori 算法分析股票数据中的关联规则
+    """
+    print("\n   分析关联规则...")
+
+    # 将特征转换为布尔值 (0 或 1)
+    df_encoded = df.applymap(lambda x: 1 if isinstance(x, (int, float)) and x > 0 else 0)
+
+    # 使用 Apriori 算法找到频繁项集
+    frequent_itemsets = apriori(df_encoded, min_support=0.05, use_colnames=True)  # 调整 min_support
+
+    # 生成关联规则
+    rules = association_rules(frequent_itemsets, metric="confidence", min_threshold=0.5)  # 调整 metric 和 min_threshold
+
+    print(f"   找到 {len(rules)} 条关联规则")
+    return rules
 
 
 def main():
     """主程序"""
     print("\n" + "="*60)
     print("动态选股系统 - 实时计算版")
-    print("集成神经网络进行精准评分 (TensorFlow + Optuna)")
+    print("集成神经网络进行精准评分 (Scikit-learn + Optuna)")
+    print("集成关联规则挖掘 (Apriori)")
     print(f"运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("="*60)
 
@@ -281,17 +303,17 @@ def main():
         for col in ['最新价', '最高', '最低', '开盘', '昨收']:
             if col in df.columns:
                 new_col = col.replace('价', '')
-                df[new_col] = col.apply(
+                df[new_col] = df[col].astype(str).apply(  # 转换为字符串再处理
                     lambda x: f" {float(x):.2f}" if pd.notna(x) and str(x) not in ['--', '', None] else " --"
                 )
 
         if '涨跌幅' in df.columns:
-            df['涨幅%'] = df['涨跌幅'].apply(
+            df['涨幅%'] = df['涨跌幅'].astype(str).apply(  # 转换为字符串再处理
                 lambda x: f" {float(x):.2f}" if pd.notna(x) else " --"
             )
 
         if '换手率' in df.columns:
-            df['实际换手%'] = df['换手率'].apply(
+            df['实际换手%'] = df['换手率'].astype(str).apply(  # 转换为字符串再处理
                 lambda x: f" {float(x):.2f}" if pd.notna(x) else " --"
             )
 
@@ -308,6 +330,7 @@ def main():
 
     except Exception as e:
         print(f"   ❌ 实时获取失败: {e}")
+        print(f"   错误信息: {e}")  # 打印详细错误信息
         print("   使用参考数据作为备选...")
 
         # 使用参考数据
@@ -365,14 +388,18 @@ def main():
 
     # ========== 第二步：训练神经网络 ==========
     print("\n2. 训练神经网络模型...")
-    model, scaler, r2_score = train_neural_network(final_df)
+    model, scaler, r2_score_nn = train_neural_network(final_df)
 
     if model is None:
         print("   ❌ 神经网络训练失败，无法进行后续筛选。")
         return
 
-    # ========== 第三步：动态筛选优质股票 ==========
-    print("\n3. 动态筛选优质股票...")
+    # ========== 第三步：分析关联规则 ==========
+    print("\n3. 分析关联规则...")
+    rules = analyze_association_rules(final_df)
+
+    # ========== 第四步：动态筛选优质股票 ==========
+    print("\n4. 动态筛选优质股票...")
 
     # 创建一个包含所有股票评分的列
     final_df['神经网络评分'] = final_df.apply(lambda row: predict_score_with_nn(row, model, scaler), axis=1)
@@ -384,8 +411,8 @@ def main():
     stats = {'F': 0, 'G': 0, 'H': 0, 'I': 0, 'J': 0}
 
     for idx, row in final_df.iterrows():
-        score = row['神经网络评分']  # 直接使用神经网络评分
-        conditions = ""  # 神经网络评分不需要条件
+        score_nn = row['神经网络评分']  # 神经网络评分
+        conditions = ""
 
         # 统计（原始评分方式的统计，如果只用神经网络，可以移除）
         features = calculate_features(row)
@@ -395,14 +422,26 @@ def main():
         if features[3] <= 25: stats['I'] += 1
         if features[4] >= 200: stats['J'] += 1
 
+        #  综合评分：神经网络评分 + 关联规则加权
+        #  这里只是一个示例，你需要根据你的关联规则分析结果来设计加权策略
+        score_rules = 0.0  # 初始关联规则评分
+
+        #  示例：如果股票满足某些关联规则，则增加评分
+        #  你需要根据你的 rules 对象来编写具体的规则判断逻辑
+        # for rule in rules:
+        #     if row['所属行业'] in rule.antecedents and row['涨幅%'] in rule.consequents:
+        #         score_rules += rule.confidence  # 使用置信度作为加权
+
+        final_score = score_nn + score_rules  # 综合评分
+
         # 判断是否达标
-        if score >= threshold:
+        if final_score >= threshold:
             code = str(row['代码']).replace('= "', '').replace('"', '')
             quality_stocks.append({
                 '代码': code,
                 '名称': str(row['名称']).strip(),
                 '行业': str(row['所属行业']).strip(),
-                '优质率': score,
+                '优质率': final_score,
                 '满足条件': conditions,
                 '涨幅': str(row['涨幅%']).strip()
             })
@@ -435,19 +474,25 @@ def main():
                     '名称': str(row['名称']).strip(),
                     '行业': str(row['所属行业']).strip(),
                     '优质率': score,
-                    '满足条件': "",  # 神经网络评分不需要条件
+                    '满足条件': "",
                     '涨幅': str(row['涨幅%']).strip()
                 })
 
         quality_stocks = sorted(quality_stocks, key=lambda x: (x['优质率'], x['代码']), reverse=True)
         quality_stocks = quality_stocks[:12]  # 只取前12只
 
+    #  计算最终模型评分 (示例)
+    final_model_score = (r2_score_nn + len(rules) * 0.1)  #  神经网络 R^2 + 关联规则数量加权
+    #  请根据实际情况调整评分计算方式
+
     # 保存优质股票
     output_file2 = '输出数据/优质股票.txt'
     with open(output_file2, 'w', encoding='utf-8') as f:
-        f.write("苏氏量化策略 - 优质股票筛选结果 (TensorFlow + Optuna 神经网络评分)\n")
+        f.write("苏氏量化策略 - 优质股票筛选结果 (Scikit-learn + Optuna 神经网络评分 + Apriori 关联规则)\n")
         f.write(f"筛选时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"模型准确率 (R^2): {r2_score:.4f}\n") # 显示模型准确率
+        f.write(f"模型最终评分: {final_model_score:.4f}\n")  # 显示模型最终评分
+        f.write(f"神经网络 R^2: {r2_score_nn:.4f}\n")  # 显示神经网络的 R^2
+        f.write(f"关联规则数量: {len(rules)}\n")  # 显示关联规则数量
         f.write(f"筛选阈值: {threshold:.4f}\n")  # 显示神经网络的阈值
         f.write(f"优质股票数量: {len(quality_stocks)}\n")
         f.write("=" * 50 + "\n\n")
