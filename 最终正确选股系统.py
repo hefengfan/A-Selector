@@ -26,9 +26,6 @@ import optuna
 from mlxtend.frequent_patterns import apriori, association_rules
 from mlxtend.preprocessing import TransactionEncoder
 
-# 技术分析库
-import talib
-
 # 清除代理设置
 os.environ['HTTP_PROXY'] = ''
 os.environ['HTTPS_PROXY'] = ''
@@ -121,54 +118,60 @@ def calculate_features(row):
 
 def calculate_technical_indicators(df, code):
     """
-    计算技术指标：MACD, RSI, BOLL
+    计算技术指标：简单移动平均线交叉, RSI, 价格与布林带关系, 成交量变化率
     """
     try:
         # 获取历史数据
         stock_df = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq").iloc[-60:]  # 最近60个交易日
-        
+
         if len(stock_df) < 20:
-            return 0, 0, 0, 0
-        
-        # 计算MACD
-        stock_df['MACD'], stock_df['MACDsignal'], stock_df['MACDhist'] = talib.MACD(
-            stock_df['收盘'], fastperiod=12, slowperiod=26, signalperiod=9)
-        
-        # 计算RSI
-        stock_df['RSI'] = talib.RSI(stock_df['收盘'], timeperiod=14)
-        
-        # 计算布林带
-        stock_df['upper'], stock_df['middle'], stock_df['lower'] = talib.BBANDS(
-            stock_df['收盘'], timeperiod=20, nbdevup=2, nbdevdn=2, matype=0)
-        
-        # 获取最新值
-        last_row = stock_df.iloc[-1]
-        
-        # MACD信号 (1:金叉, -1:死叉, 0:无)
-        macd_signal = 0
-        if last_row['MACD'] > last_row['MACDsignal'] and stock_df.iloc[-2]['MACD'] <= stock_df.iloc[-2]['MACDsignal']:
-            macd_signal = 1
-        elif last_row['MACD'] < last_row['MACDsignal'] and stock_df.iloc[-2]['MACD'] >= stock_df.iloc[-2]['MACDsignal']:
-            macd_signal = -1
-        
-        # RSI值
-        rsi = last_row['RSI']
-        
+            return 0, 50, 0, 1
+
+        # 计算简单移动平均线
+        stock_df['SMA_5'] = stock_df['收盘'].rolling(window=5).mean()
+        stock_df['SMA_20'] = stock_df['收盘'].rolling(window=20).mean()
+
+        # 简单移动平均线交叉信号 (1:金叉, -1:死叉, 0:无)
+        sma_signal = 0
+        if stock_df['SMA_5'].iloc[-1] > stock_df['SMA_20'].iloc[-1] and stock_df['SMA_5'].iloc[-2] <= stock_df['SMA_20'].iloc[-2]:
+            sma_signal = 1
+        elif stock_df['SMA_5'].iloc[-1] < stock_df['SMA_20'].iloc[-1] and stock_df['SMA_5'].iloc[-2] >= stock_df['SMA_20'].iloc[-2]:
+            sma_signal = -1
+
+        # 计算相对强弱指标 (RSI) - 简化计算
+        close_prices = stock_df['收盘'].values
+        price_changes = np.diff(close_prices)
+        gains = price_changes[price_changes > 0]
+        losses = -price_changes[price_changes < 0]
+
+        avg_gain = np.mean(gains) if len(gains) > 0 else 0
+        avg_loss = np.mean(losses) if len(losses) > 0 else 0
+
+        rs = avg_gain / avg_loss if avg_loss > 0 else 0
+        rsi = 100 - (100 / (1 + rs))
+        rsi = np.clip(rsi, 0, 100) # 确保RSI在0-100之间
+
+        # 计算布林带 - 简化计算
+        stock_df['StdDev'] = stock_df['收盘'].rolling(window=20).std()
+        stock_df['Middle'] = stock_df['收盘'].rolling(window=20).mean()
+        stock_df['Upper'] = stock_df['Middle'] + 2 * stock_df['StdDev']
+        stock_df['Lower'] = stock_df['Middle'] - 2 * stock_df['StdDev']
+
         # 布林带位置 (1:上轨, -1:下轨, 0:中轨)
         boll_position = 0
-        close_price = last_row['收盘']
-        if close_price > last_row['upper']:
+        close_price = stock_df['收盘'].iloc[-1]
+        if close_price > stock_df['Upper'].iloc[-1]:
             boll_position = 1
-        elif close_price < last_row['lower']:
+        elif close_price < stock_df['Lower'].iloc[-1]:
             boll_position = -1
-        
+
         # 成交量变化率 (5日平均成交量/20日平均成交量)
         vol_5 = stock_df['成交量'].tail(5).mean()
         vol_20 = stock_df['成交量'].tail(20).mean()
         vol_ratio = vol_5 / vol_20 if vol_20 > 0 else 1
-        
-        return macd_signal, rsi, boll_position, vol_ratio
-    
+
+        return sma_signal, rsi, boll_position, vol_ratio
+
     except Exception as e:
         print(f"计算技术指标时出错({code}): {e}")
         return 0, 50, 0, 1
@@ -617,7 +620,7 @@ def main():
         long_term_score = predict_score_with_nn(row, model_long_term, scaler_long_term)
         
         # 计算技术指标
-        macd, rsi, boll, vol_ratio = calculate_technical_indicators(df_for_scoring, code)
+        sma, rsi, boll, vol_ratio = calculate_technical_indicators(df_for_scoring, code)
 
         if pd.notna(comprehensive_score) and pd.notna(short_term_score) and pd.notna(long_term_score):
             quality_stocks.append({
@@ -631,7 +634,7 @@ def main():
                 '总市值': safe_float(row['总市值']),
                 '换手率': safe_float(row['实际换手%']),
                 '市盈率(动)': safe_float(row['市盈率(动)']),
-                'MACD': macd,
+                'SMA': sma,
                 'RSI': rsi,
                 'BOLL': boll,
                 '成交量比': vol_ratio
@@ -656,7 +659,7 @@ def main():
     # 保存优质股票
     output_file2 = '输出数据/优质股票.txt'
     with open(output_file2, 'w', encoding='utf-8') as f:
-        f.write("苏氏量化策略 - 优质股票筛选结果 (神经网络评分)\n")
+        f.write("苏氏量量化策略 - 优质股票筛选结果 (神经网络评分)\n")
         f.write(f"筛选时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"最低综合评分阈值 (基于前{display_count}名或全部): {threshold:.4f}\n")
         f.write(f"优质股票数量: {len(quality_stocks_filtered)}\n")
@@ -673,7 +676,7 @@ def main():
             f.write(f"总市值: {stock['总市值']:.2f} 亿\n")
             f.write(f"换手率: {stock['换手率']:.2f}%\n")
             f.write(f"市盈率(动): {stock['市盈率(动)']:.2f}\n")
-            f.write(f"技术指标 - MACD信号: {stock['MACD']}, RSI: {stock['RSI']:.1f}, BOLL位置: {stock['BOLL']}, 成交量比: {stock['成交量比']:.2f}\n")
+            f.write(f"技术指标 - SMA信号: {stock['SMA']}, RSI: {stock['RSI']:.1f}, BOLL位置: {stock['BOLL']}, 成交量比: {stock['成交量比']:.2f}\n")
             f.write("-"*30 + "\n")
 
         print(f"\n✅ 优质股票已保存: {output_file2}")
@@ -685,7 +688,7 @@ def main():
         print(f"{'股票代码':<10} {'股票名称':<12} {'涨幅%':<8} {'综合评分':<10} {'短期评分':<10} {'长期评分':<10} {'总市值(亿)':<12} {'换手率(%)':<10} {'市盈率(动)':<12} {'所属行业':<15}")
         print("-"*130)
         for stock in quality_stocks_filtered:
-            print(f"{stock['代码']:<10} {stock['名称']:<12} {stock['涨幅']:<8.2f} {stock['综合评分']:<10.4f} {stock['短期评分']:<10.4f} {stock['长期评分']:<10.4f} {stock['总市值']:<12.2f} {stock['换手率']:<10.2f} {stock['市盈率(动)']:<12.2f} {stock['行业']:<15}")
+            print(f"{stock['代码']:<10} {stock['名称']:<12} {stock['涨幅']:<8.2f} {stock['综合评分']:<10.4f} {stock['短期评分']:<10.4f} {stock['长期评分']:<10.4f} {stock['总市值']:<12.2f} {stock['换手率']:<10.2f} {stock['市盈率(动)':<12.2f} {stock['行业']:<15}")
 
         # ========== 第五步：结合分析给出投资建议 ==========
         print("\n   投资建议 (基于模型评分、技术指标和基本面):")
@@ -700,7 +703,7 @@ def main():
             turnover_rate = stock['换手率']
             pe_ratio = stock['市盈率(动)']
             industry = stock['行业']
-            macd = stock['MACD']
+            sma = stock['SMA']
             rsi = stock['RSI']
             boll = stock['BOLL']
             vol_ratio = stock['成交量比']
@@ -711,7 +714,7 @@ def main():
             debt_level = "健康" if market_cap > 100 else "一般"  # 简化评估
             
             # 2. 技术面分析
-            macd_signal = "金叉" if macd == 1 else "死叉" if macd == -1 else "中性"
+            sma_signal = "金叉" if sma == 1 else "死叉" if sma == -1 else "中性"
             rsi_signal = "超买" if rsi > 70 else "超卖" if rsi < 30 else "中性"
             boll_signal = "上轨" if boll == 1 else "下轨" if boll == -1 else "中轨"
             volume_signal = "放量" if vol_ratio > 1.2 else "缩量" if vol_ratio < 0.8 else "平量"
@@ -721,15 +724,15 @@ def main():
             print(f"     所属行业: {industry}")
             print(f"     综合评分: {comprehensive_score:.4f} | 短期评分: {short_term_score:.4f} | 长期评分: {long_term_score:.4f}")
             print(f"     基本面: 盈利能力-{profitability}, 成长潜力-{growth_potential}, 负债水平-{debt_level}")
-            print(f"     技术面: MACD-{macd_signal}, RSI-{rsi_signal}({rsi:.1f}), BOLL-{boll_signal}, 成交量-{volume_signal}({vol_ratio:.2f})")
+            print(f"     技术面: SMA-{sma_signal}, RSI-{rsi_signal}({rsi:.1f}), BOLL-{boll_signal}, 成交量-{volume_signal}({vol_ratio:.2f})")
             
             # 投资建议 - 根据评分和技术指标
             # 短期策略 (1-5个交易日)
             short_term_recommendation = ""
             if short_term_score > 0.7:
-                if macd == 1 and rsi < 70 and boll != 1:
+                if sma == 1 and rsi < 70 and boll != 1:
                     short_term_recommendation = "强烈买入"
-                elif macd == 1 or rsi < 30:
+                elif sma == 1 or rsi < 30:
                     short_term_recommendation = "买入"
                 else:
                     short_term_recommendation = "谨慎买入"
@@ -794,3 +797,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
