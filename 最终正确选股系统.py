@@ -8,7 +8,7 @@
 import akshare as ak
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import warnings
 warnings.filterwarnings('ignore')
@@ -16,7 +16,7 @@ warnings.filterwarnings('ignore')
 # 导入神经网络相关库
 from sklearn.neural_network import MLPRegressor
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.metrics import mean_squared_error, r2_score
 
 # 导入 Optuna 进行超参数优化
@@ -25,6 +25,9 @@ import optuna
 # 导入 mlxtend 进行关联规则挖掘
 from mlxtend.frequent_patterns import apriori, association_rules
 from mlxtend.preprocessing import TransactionEncoder
+
+# 技术分析库
+import talib
 
 # 清除代理设置
 os.environ['HTTP_PROXY'] = ''
@@ -116,7 +119,61 @@ def calculate_features(row):
 
     return features
 
-def objective(trial, X_train, y_train, X_test, y_test):
+def calculate_technical_indicators(df, code):
+    """
+    计算技术指标：MACD, RSI, BOLL
+    """
+    try:
+        # 获取历史数据
+        stock_df = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq").iloc[-60:]  # 最近60个交易日
+        
+        if len(stock_df) < 20:
+            return 0, 0, 0, 0
+        
+        # 计算MACD
+        stock_df['MACD'], stock_df['MACDsignal'], stock_df['MACDhist'] = talib.MACD(
+            stock_df['收盘'], fastperiod=12, slowperiod=26, signalperiod=9)
+        
+        # 计算RSI
+        stock_df['RSI'] = talib.RSI(stock_df['收盘'], timeperiod=14)
+        
+        # 计算布林带
+        stock_df['upper'], stock_df['middle'], stock_df['lower'] = talib.BBANDS(
+            stock_df['收盘'], timeperiod=20, nbdevup=2, nbdevdn=2, matype=0)
+        
+        # 获取最新值
+        last_row = stock_df.iloc[-1]
+        
+        # MACD信号 (1:金叉, -1:死叉, 0:无)
+        macd_signal = 0
+        if last_row['MACD'] > last_row['MACDsignal'] and stock_df.iloc[-2]['MACD'] <= stock_df.iloc[-2]['MACDsignal']:
+            macd_signal = 1
+        elif last_row['MACD'] < last_row['MACDsignal'] and stock_df.iloc[-2]['MACD'] >= stock_df.iloc[-2]['MACDsignal']:
+            macd_signal = -1
+        
+        # RSI值
+        rsi = last_row['RSI']
+        
+        # 布林带位置 (1:上轨, -1:下轨, 0:中轨)
+        boll_position = 0
+        close_price = last_row['收盘']
+        if close_price > last_row['upper']:
+            boll_position = 1
+        elif close_price < last_row['lower']:
+            boll_position = -1
+        
+        # 成交量变化率 (5日平均成交量/20日平均成交量)
+        vol_5 = stock_df['成交量'].tail(5).mean()
+        vol_20 = stock_df['成交量'].tail(20).mean()
+        vol_ratio = vol_5 / vol_20 if vol_20 > 0 else 1
+        
+        return macd_signal, rsi, boll_position, vol_ratio
+    
+    except Exception as e:
+        print(f"计算技术指标时出错({code}): {e}")
+        return 0, 50, 0, 1
+
+def objective(trial, X_train, y_train, X_test, y_test, target_type):
     """
     Optuna 优化目标函数
     """
@@ -129,6 +186,13 @@ def objective(trial, X_train, y_train, X_test, y_test):
     solver = trial.suggest_categorical('solver', ['adam', 'sgd'])
     alpha = trial.suggest_loguniform('alpha', 1e-5, 1e-1)
     learning_rate_init = trial.suggest_loguniform('learning_rate_init', 1e-4, 1e-2)
+    
+    # 根据目标类型调整参数范围
+    if target_type == 'short_term':
+        learning_rate_init = trial.suggest_loguniform('learning_rate_init', 1e-3, 0.1)
+        n_iter_no_change = 10
+    else:  # long_term
+        n_iter_no_change = 30
 
     model = MLPRegressor(
         hidden_layer_sizes=tuple(hidden_layer_sizes),
@@ -139,23 +203,22 @@ def objective(trial, X_train, y_train, X_test, y_test):
         random_state=42,
         max_iter=500,
         early_stopping=True,
-        n_iter_no_change=20, # 增加耐心
-        tol=1e-4 # 增加容忍度
+        n_iter_no_change=n_iter_no_change,
+        tol=1e-4
     )
     model.fit(X_train, y_train)
     y_pred = model.predict(X_test)
     mse = mean_squared_error(y_test, y_pred)
-    return mse # Optuna 默认最小化目标
+    return mse
 
-def train_neural_network(df):
+def train_neural_network(df, target_type='comprehensive'):
     """
     训练神经网络模型，预测股票评分，使用 Optuna 进行超参数优化。
-    使用复合质量评分作为目标变量。
+    支持三种目标类型：短期、长期、综合
     """
-    print("\n   准备训练数据...")
+    print(f"\n   准备训练数据 ({target_type}模型)...")
     X = []
-    # y = []  # 目标变量：涨幅作为评分的依据
-
+    
     for _, row in df.iterrows():
         features = calculate_features(row)
         X.append(features)
@@ -170,29 +233,41 @@ def train_neural_network(df):
     pe_ratio = df['市盈率(动)'].apply(safe_float)
 
     # 归一化各个指标 (使用 min-max 归一化)
-    change_norm = (change - change.min()) / (change.max() - change.min())
-    profit_norm = (profit - profit.min()) / (profit.max() - profit.min())
-    turnover_norm = (turnover - turnover.min()) / (turnover.max() - turnover.min())
-    market_cap_norm = (market_cap - market_cap.min()) / (market_cap.max() - market_cap.min())
-    pe_ratio_norm = (pe_ratio - pe_ratio.min()) / (pe_ratio.max() - pe_ratio.min())
+    scaler = MinMaxScaler()
+    change_norm = scaler.fit_transform(change.values.reshape(-1, 1)).flatten()
+    profit_norm = scaler.fit_transform(profit.values.reshape(-1, 1)).flatten()
+    turnover_norm = scaler.fit_transform(turnover.values.reshape(-1, 1)).flatten()
+    market_cap_norm = scaler.fit_transform(market_cap.values.reshape(-1, 1)).flatten()
+    pe_ratio_norm = scaler.fit_transform(pe_ratio.values.reshape(-1, 1)).flatten()
 
     # 处理 NaN 值，用 0 填充
-    change_norm = change_norm.fillna(0)
-    profit_norm = profit_norm.fillna(0)
-    turnover_norm = turnover_norm.fillna(0)
-    market_cap_norm = market_cap_norm.fillna(0)
-    pe_ratio_norm = pe_ratio_norm.fillna(0)
+    change_norm = np.nan_to_num(change_norm, nan=0)
+    profit_norm = np.nan_to_num(profit_norm, nan=0)
+    turnover_norm = np.nan_to_num(turnover_norm, nan=0)
+    market_cap_norm = np.nan_to_num(market_cap_norm, nan=0)
+    pe_ratio_norm = np.nan_to_num(pe_ratio_norm, nan=0)
 
-    # 计算复合质量评分 (可以调整权重)
-    df['quality_score'] = (
-        0.4 * change_norm +  # 涨幅 (权重增加)
-        0.2 * profit_norm +  # 净利润 (权重略微降低)
-        0.15 * (1 - abs(turnover_norm - 0.5)) +  # 换手率 (适中最好)
-        0.15 * market_cap_norm +  # 市值 (权重略微降低)
-        0.1 * (1 - pe_ratio_norm)  # 市盈率 (越低越好) (权重略微降低)
-    )
-
-    y = df['quality_score'].values
+    # 根据目标类型计算不同的评分
+    if target_type == 'short_term':
+        # 短期评分: 主要关注技术面和市场情绪
+        y = (0.5 * change_norm + 
+             0.3 * turnover_norm + 
+             0.2 * (1 - abs(turnover_norm - 0.5)))  # 换手率适中最好
+        
+    elif target_type == 'long_term':
+        # 长期评分: 主要关注基本面和价值
+        y = (0.4 * profit_norm + 
+             0.3 * market_cap_norm + 
+             0.2 * (1 - pe_ratio_norm) + 
+             0.1 * change_norm)  # 市盈率越低越好
+        
+    else:  # comprehensive
+        # 综合评分
+        y = (0.4 * change_norm + 
+             0.2 * profit_norm + 
+             0.15 * (1 - abs(turnover_norm - 0.5)) + 
+             0.15 * market_cap_norm + 
+             0.1 * (1 - pe_ratio_norm))
 
     # 移除包含 NaN 或无穷大的行
     mask = ~np.any(np.isnan(X) | np.isinf(X), axis=1) & ~np.isnan(y) & ~np.isinf(y)
@@ -200,7 +275,7 @@ def train_neural_network(df):
     y = y[mask]
 
     if len(X) < 20: # 至少需要一些数据来划分训练集和测试集
-        print("   ❌ 有效训练数据不足，无法训练神经网络。")
+        print(f"   ❌ 有效训练数据不足，无法训练{target_type}神经网络。")
         return None, None
 
     print(f"   有效训练样本数: {len(X)}")
@@ -218,7 +293,8 @@ def train_neural_network(df):
     print("   启动 Optuna 超参数优化 (可能需要一些时间)...")
     study = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=42))
     try:
-        study.optimize(lambda trial: objective(trial, X_train, y_train, X_test, y_test), n_trials=50, show_progress_bar=True)
+        study.optimize(lambda trial: objective(trial, X_train, y_train, X_test, y_test, target_type), 
+                       n_trials=50, show_progress_bar=True)
     except Exception as e:
         print(f"   Optuna 优化过程中发生错误: {e}")
         print("   将使用默认或预设参数训练模型。")
@@ -504,9 +580,16 @@ def main():
 
     # ========== 第二步：训练神经网络 ==========
     print("\n2. 训练神经网络模型...")
-    model, scaler = train_neural_network(df.copy()) # 传入原始数值的df副本
+    print("   - 训练综合模型...")
+    model_comprehensive, scaler_comprehensive = train_neural_network(df.copy(), 'comprehensive')
+    
+    print("\n   - 训练短期模型...")
+    model_short_term, scaler_short_term = train_neural_network(df.copy(), 'short_term')
+    
+    print("\n   - 训练长期模型...")
+    model_long_term, scaler_long_term = train_neural_network(df.copy(), 'long_term')
 
-    if model is None:
+    if model_comprehensive is None or model_short_term is None or model_long_term is None:
         print("   ❌ 神经网络训练失败，无法进行后续筛选。")
         return
 
@@ -523,32 +606,48 @@ def main():
 
 
     for idx, row in df_for_scoring.iterrows():
-        score = predict_score_with_nn(row, model, scaler)
+        code = str(row['原始代码']).strip()
+        # 计算综合评分
+        comprehensive_score = predict_score_with_nn(row, model_comprehensive, scaler_comprehensive)
+        
+        # 计算短期评分
+        short_term_score = predict_score_with_nn(row, model_short_term, scaler_short_term)
+        
+        # 计算长期评分
+        long_term_score = predict_score_with_nn(row, model_long_term, scaler_long_term)
+        
+        # 计算技术指标
+        macd, rsi, boll, vol_ratio = calculate_technical_indicators(df_for_scoring, code)
 
-        if pd.notna(score): # 确保分数有效
-            code = str(row['原始代码']).strip()
+        if pd.notna(comprehensive_score) and pd.notna(short_term_score) and pd.notna(long_term_score):
             quality_stocks.append({
                 '代码': code,
                 '名称': str(row['名称']).strip(),
                 '行业': str(row['所属行业']).strip(),
-                '优质率': score,
-                '涨幅': f"{safe_float(row['涨幅%']):.2f}%" if pd.notna(safe_float(row['涨幅%'])) else "--",
+                '综合评分': comprehensive_score,
+                '短期评分': short_term_score,
+                '长期评分': long_term_score,
+                '涨幅': safe_float(row['涨幅%']),
                 '总市值': safe_float(row['总市值']),
                 '换手率': safe_float(row['实际换手%']),
-                '市盈率(动)': safe_float(row['市盈率(动)'])
+                '市盈率(动)': safe_float(row['市盈率(动)']),
+                'MACD': macd,
+                'RSI': rsi,
+                'BOLL': boll,
+                '成交量比': vol_ratio
             })
 
-    # 按优质率降序排序
-    quality_stocks = sorted(quality_stocks, key=lambda x: (x['优质率'], x['代码']), reverse=True)
+    # 按综合评分降序排序
+    quality_stocks = sorted(quality_stocks, key=lambda x: (x['综合评分'], x['代码']), reverse=True)
 
     # 确定筛选阈值：取前N个，或者根据分数分布动态调整
     display_count = 15 # 默认显示前15个
     if len(quality_stocks) > display_count:
         # 如果股票数量足够，取前N个的最低分数作为阈值
-        threshold = quality_stocks[display_count-1]['优质率']
+        threshold = quality_stocks[display_count-1]['综合评分']
         quality_stocks_filtered = quality_stocks[:display_count]
     elif len(quality_stocks) > 0:
-        threshold = quality_stocks[-1]['优质率'] # 所有股票的最低分
+        threshold = quality_stocks[-1]['综合评分'] # 所有股票的最低分
         quality_stocks_filtered = quality_stocks
     else:
         threshold = 0.0
@@ -559,7 +658,7 @@ def main():
     with open(output_file2, 'w', encoding='utf-8') as f:
         f.write("苏氏量化策略 - 优质股票筛选结果 (神经网络评分)\n")
         f.write(f"筛选时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"最低优质率阈值 (基于前{display_count}名或全部): {threshold:.4f}\n")
+        f.write(f"最低综合评分阈值 (基于前{display_count}名或全部): {threshold:.4f}\n")
         f.write(f"优质股票数量: {len(quality_stocks_filtered)}\n")
         f.write("="*50 + "\n\n")
 
@@ -567,74 +666,115 @@ def main():
             f.write(f"股票代码: {stock['代码']}\n")
             f.write(f"股票名称: {stock['名称']}\n")
             f.write(f"所属行业: {stock['行业']}\n")
-            f.write(f"优质率 (NN评分): {stock['优质率']:.4f}\n")
-            f.write(f"今日涨幅: {stock['涨幅']}\n")
+            f.write(f"综合评分: {stock['综合评分']:.4f}\n")
+            f.write(f"短期评分: {stock['短期评分']:.4f}\n")
+            f.write(f"长期评分: {stock['长期评分']:.4f}\n")
+            f.write(f"今日涨幅: {stock['涨幅']:.2f}%\n")
             f.write(f"总市值: {stock['总市值']:.2f} 亿\n")
             f.write(f"换手率: {stock['换手率']:.2f}%\n")
             f.write(f"市盈率(动): {stock['市盈率(动)']:.2f}\n")
+            f.write(f"技术指标 - MACD信号: {stock['MACD']}, RSI: {stock['RSI']:.1f}, BOLL位置: {stock['BOLL']}, 成交量比: {stock['成交量比']:.2f}\n")
             f.write("-"*30 + "\n")
 
         print(f"\n✅ 优质股票已保存: {output_file2}")
-    print(f"   找到 {len(quality_stocks_filtered)} 只优质股票（最低优质率={threshold:.4f}）")
+    print(f"   找到 {len(quality_stocks_filtered)} 只优质股票（最低综合评分={threshold:.4f}）")
 
     if len(quality_stocks_filtered) > 0:
         print(f"\n🎯 今日优质股票列表 (前{len(quality_stocks_filtered)}名)：")
-        print("="*90)
-        print(f"{'股票代码':<10} {'股票名称':<12} {'涨幅':<8} {'优质率':<10} {'总市值(亿)':<12} {'换手率(%)':<10} {'市盈率(动)':<12} {'所属行业':<15}")
-        print("-"*90)
+        print("="*130)
+        print(f"{'股票代码':<10} {'股票名称':<12} {'涨幅%':<8} {'综合评分':<10} {'短期评分':<10} {'长期评分':<10} {'总市值(亿)':<12} {'换手率(%)':<10} {'市盈率(动)':<12} {'所属行业':<15}")
+        print("-"*130)
         for stock in quality_stocks_filtered:
-            print(f"{stock['代码']:<10} {stock['名称']:<12} {stock['涨幅']:<8} {stock['优质率']:.4f}   {stock['总市值']:.2f}   {stock['换手率']:.2f}   {stock['市盈率(动)']:.2f}   {stock['行业']:<15}")
+            print(f"{stock['代码']:<10} {stock['名称']:<12} {stock['涨幅']:<8.2f} {stock['综合评分']:<10.4f} {stock['短期评分']:<10.4f} {stock['长期评分']:<10.4f} {stock['总市值']:<12.2f} {stock['换手率']:<10.2f} {stock['市盈率(动)']:<12.2f} {stock['行业']:<15}")
 
         # ========== 第五步：结合分析给出投资建议 ==========
-        print("\n   投资建议 (基于模型评分、关联规则和基本面):")
+        print("\n   投资建议 (基于模型评分、技术指标和基本面):")
         for stock in quality_stocks_filtered:
             code = stock['代码']
             name = stock['名称']
-            quality_score = stock['优质率']
-            change_percent = float(stock['涨幅'].replace('%', '')) if stock['涨幅'] != '--' else 0
+            comprehensive_score = stock['综合评分']
+            short_term_score = stock['短期评分']
+            long_term_score = stock['长期评分']
+            change_percent = stock['涨幅']
             market_cap = stock['总市值']
             turnover_rate = stock['换手率']
             pe_ratio = stock['市盈率(动)']
             industry = stock['行业']
+            macd = stock['MACD']
+            rsi = stock['RSI']
+            boll = stock['BOLL']
+            vol_ratio = stock['成交量比']
 
             # 1. 基本面分析
-            # 这里可以加入更详细的基本面分析，例如 ROE、营收增长率等
-            # 但由于数据限制，这里只使用已有的数据
-            profitability = "良好" if pe_ratio > 0 and pe_ratio < 30 else "一般" # 市盈率
-            size = "大型" if market_cap > 1000 else "中小型" # 市值
-
-            # 2. 技术面分析 (简化)
-            # 这里可以加入均线、MACD 等技术指标的分析
-            momentum = "强" if change_percent > 2 else "弱"  # 涨幅
-
-            # 3. 关联规则分析 (简化)
-            # 这里可以根据关联规则的结果，判断哪些条件组合更有可能带来高涨幅
-            # 由于关联规则结果是动态的，这里只做一个示例
-            rule_signal = "积极" if quality_score > 0.7 and turnover_rate < 20 else "中性"
-
-            # 4. 综合判断和建议
+            profitability = "优秀" if pe_ratio > 0 and pe_ratio < 15 else "良好" if pe_ratio < 30 else "一般"
+            growth_potential = "高" if market_cap < 500 and turnover_rate > 5 else "中" if market_cap < 1000 else "低"
+            debt_level = "健康" if market_cap > 100 else "一般"  # 简化评估
+            
+            # 2. 技术面分析
+            macd_signal = "金叉" if macd == 1 else "死叉" if macd == -1 else "中性"
+            rsi_signal = "超买" if rsi > 70 else "超卖" if rsi < 30 else "中性"
+            boll_signal = "上轨" if boll == 1 else "下轨" if boll == -1 else "中轨"
+            volume_signal = "放量" if vol_ratio > 1.2 else "缩量" if vol_ratio < 0.8 else "平量"
+            
+            # 3. 综合判断和建议
             print(f"\n   股票代码: {code} ({name})")
-            print(f"     综合评分: {quality_score:.4f}")
             print(f"     所属行业: {industry}")
-            print(f"     基本面: {size}公司，盈利能力{profitability}")
-            print(f"     技术面: 今日动量{momentum}")
-            print(f"     关联规则信号: {rule_signal}")
-
-            # 投资建议
-            if quality_score > 0.8 and momentum == "强" and rule_signal == "积极":
-                if market_cap < 500:
-                    print("     建议: (短线)可考虑少量买入，设置5%止损。") # 短线交易，设置止损
+            print(f"     综合评分: {comprehensive_score:.4f} | 短期评分: {short_term_score:.4f} | 长期评分: {long_term_score:.4f}")
+            print(f"     基本面: 盈利能力-{profitability}, 成长潜力-{growth_potential}, 负债水平-{debt_level}")
+            print(f"     技术面: MACD-{macd_signal}, RSI-{rsi_signal}({rsi:.1f}), BOLL-{boll_signal}, 成交量-{volume_signal}({vol_ratio:.2f})")
+            
+            # 投资建议 - 根据评分和技术指标
+            # 短期策略 (1-5个交易日)
+            short_term_recommendation = ""
+            if short_term_score > 0.7:
+                if macd == 1 and rsi < 70 and boll != 1:
+                    short_term_recommendation = "强烈买入"
+                elif macd == 1 or rsi < 30:
+                    short_term_recommendation = "买入"
                 else:
-                    if pe_ratio < 50: # 容忍更高的市盈率
-                        print("     建议: (中长线)成长性较好，可作为中长期投资标的。")
-                    else:
-                        print("     建议: 谨慎买入，关注后续财报数据。")
-            elif quality_score > 0.6 and momentum == "强":
-                print("     建议: (短线)可关注，但需谨慎，快进快出。") # 短线交易
+                    short_term_recommendation = "谨慎买入"
+            elif short_term_score > 0.5:
+                short_term_recommendation = "观望"
             else:
-                print("     建议: 暂不建议买入，继续观察。")
-
-            print("-" * 50)
+                short_term_recommendation = "回避"
+                
+            # 长期策略 (1-6个月)
+            long_term_recommendation = ""
+            if long_term_score > 0.7:
+                if pe_ratio < 30 and market_cap > 50:
+                    long_term_recommendation = "强烈买入"
+                elif pe_ratio < 50:
+                    long_term_recommendation = "买入"
+                else:
+                    long_term_recommendation = "谨慎买入"
+            elif long_term_score > 0.5:
+                long_term_recommendation = "观望"
+            else:
+                long_term_recommendation = "回避"
+                
+            print(f"     短期策略(1-5天): {short_term_recommendation}")
+            print(f"     长期策略(1-6月): {long_term_recommendation}")
+            
+            # 具体操作建议
+            print(f"     具体操作:")
+            if short_term_recommendation in ["强烈买入", "买入"]:
+                print(f"       - 短期: 可在当前价位买入，目标涨幅5-8%，止损设在-3%")
+                if rsi > 70:
+                    print(f"       - 注意: RSI({rsi:.1f})已进入超买区，可等待回调介入")
+            elif short_term_recommendation == "谨慎买入":
+                print(f"       - 短期: 可轻仓参与，严格设置止损-3%，快进快出")
+            
+            if long_term_recommendation in ["强烈买入", "买入"]:
+                print(f"       - 长期: 可分批建仓，关注季度财报，目标持有3-6个月")
+                if pe_ratio > 30:
+                    print(f"       - 注意: 市盈率({pe_ratio:.1f})偏高，等待回调至合理区间")
+            elif long_term_recommendation == "谨慎买入":
+                print(f"       - 长期: 可小仓位布局，关注行业政策和基本面变化")
+            
+            if short_term_recommendation == "回避" and long_term_recommendation == "回避":
+                print("       - 暂无合适操作策略，建议观望")
+                
+            print("-" * 70)
 
     else:
         print("\n⚠️ 今日没有找到符合条件的优质股票")
@@ -654,4 +794,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
