@@ -162,23 +162,27 @@ def train_neural_network(df):
 
     X = np.array(X)
 
-    # 目标变量：生成买入信号
-    # 1. 涨幅：今日涨幅超过一定阈值（例如 1%）
+    # 目标变量：生成买入信号 (更倾向于赚大钱且稳定)
+    # 1. 涨幅：今日涨幅超过一定阈值（例如 2%）
     change = df['涨幅%'].apply(safe_float)
-    high_change = change > 1.0
+    high_change = change > 2.0  # 提高涨幅要求
 
-    # 2. 换手率：换手率适中（例如 1% - 10%），表示活跃但不过度
+    # 2. 换手率：换手率适中（例如 0.5% - 5%），表示活跃但不过度
     turnover = df['实际换手%'].apply(safe_float)
-    moderate_turnover = (turnover > 1.0) & (turnover < 10.0)
+    moderate_turnover = (turnover > 0.5) & (turnover < 5.0) # 降低换手率上限
 
-    # 3. 行业表现：假设你知道每个行业今天的平均涨幅
+    # 3. 市盈率：选择市盈率较低的股票 (价值投资)
+    pe_ratio = df['市盈率(动)'].apply(safe_float)
+    low_pe = (pe_ratio > 0) & (pe_ratio < 20)  # 选择市盈率较低的股票
+
+    # 4. 行业表现：假设你知道每个行业今天的平均涨幅
     #    这里简化为：如果该股票的涨幅超过其所在行业平均涨幅，则认为行业表现良好
     #    （需要补充行业数据，这里仅为示例）
     #    这里我们假设所有行业表现良好
     industry_good = pd.Series([True] * len(df))  # 简化：假设所有行业都好
 
     # 综合判断：所有条件都满足，则认为适合买入
-    df['buy_signal'] = high_change & moderate_turnover & industry_good
+    df['buy_signal'] = high_change & moderate_turnover & low_pe & industry_good
     y = df['buy_signal'].astype(int).values # 转换为 0/1
 
     # 移除包含 NaN 或无穷大的行
@@ -273,6 +277,18 @@ def predict_score_with_nn(row, model, scaler):
     except Exception as e:
         # print(f"预测分数时发生错误: {e}, 特征: {features}")
         return np.nan # 预测失败时返回NaN
+
+def perform_association_rule_mining(df):
+    """
+    执行关联规则挖掘
+    """
+    print("\n4. 执行关联规则挖掘...")
+    # 这里只是一个占位符，你需要实现你的关联规则挖掘逻辑
+    print("   关联规则挖掘功能尚未实现。")
+    print("   请根据你的需求实现关联规则挖掘，例如：")
+    print("   - 挖掘频繁项集，例如哪些特征经常一起出现")
+    print("   - 挖掘关联规则，例如如果出现某些特征，则很可能出现另一些特征")
+    print("   - 将关联规则的结果用于辅助决策")
 
 # ... (其他函数保持不变，除了投资建议部分) ...
 
@@ -493,44 +509,45 @@ def main():
             industry = stock['行业']
 
             # 1. 基本面分析
-            profitability = "良好" if pe_ratio > 0 and pe_ratio < 30 else "一般" # 市盈率
+            profitability = "良好" if pe_ratio > 0 and pe_ratio < 20 else "一般" # 市盈率
             size = "大型" if market_cap > 1000 else "中小型" # 市值
+            growth_potential = "高" if pe_ratio > 0 and pe_ratio < 15 else "中等" # 更低的市盈率代表更高的成长潜力
 
             # 2. 技术面分析 (简化)
-            momentum = "强" if change_percent > 2 else "弱"  # 涨幅
+            momentum = "强" if change_percent > 3 else "弱"  # 涨幅
 
             # 3. 关联规则分析 (简化)
-            rule_signal = "积极" if buy_signal > 0.7 and turnover_rate < 20 else "中性"
+            rule_signal = "积极" if buy_signal > 0.7 and turnover_rate < 10 else "中性"
 
             # 4. 风险评估 (新增)
-            volatility = "高" if turnover_rate > 10 else "低" # 换手率高表示波动大
+            volatility = "高" if turnover_rate > 8 else "低" # 换手率高表示波动大
 
             # 5. 综合判断和建议
             print(f"\n   股票代码: {code} ({name})")
             print(f"     买入信号: {buy_signal:.4f}")
             print(f"     所属行业: {industry}")
-            print(f"     基本面: {size}公司，盈利能力{profitability}")
+            print(f"     基本面: {size}公司，盈利能力{profitability}，成长潜力{growth_potential}")
             print(f"     技术面: 今日动量{momentum}")
             print(f"     关联规则信号: {rule_signal}")
             print(f"     风险评估: 波动性{volatility}")
 
             # 投资建议
             # 短期策略 (1-5个交易日)
-            if buy_signal > 0.7 and momentum == "强" and rule_signal == "积极":
+            if buy_signal > 0.8 and momentum == "强" and rule_signal == "积极":
                 if volatility == "高":
                     print("     (短线激进型)建议: 强烈建议买入，博取短期高收益，设置3%止损。")
                 else:
                     print("     (短线稳健型)建议: 建议买入，设置5%止损。")
-            elif buy_signal > 0.5 and momentum == "强":
+            elif buy_signal > 0.6 and momentum == "强":
                 print("     (短线谨慎型)建议: 可关注，但需谨慎，快进快出，设置严格止损。")
             else:
                 print("     (短线)建议: 暂不建议买入，继续观察。")
 
             # 长期策略 (1-6个月)
-            if profitability == "良好" and size == "大型" and buy_signal > 0.6:
-                print("     (长线稳健型)建议: 建议作为中长期投资标的，分批建仓。")
-            elif profitability == "良好" and size == "中小型" and buy_signal > 0.6 and volatility == "高":
-                print("     (长线成长型)建议: 具有较高成长潜力，建议少量配置，但需关注风险。")
+            if profitability == "良好" and size == "大型" and buy_signal > 0.7 and volatility == "低":
+                print("     (长线稳健型)建议: 强烈建议作为中长期投资标的，分批建仓。")
+            elif profitability == "良好" and size == "中小型" and buy_signal > 0.7 and growth_potential == "高":
+                print("     (长线成长型)建议: 强烈建议少量配置，关注风险，分批建仓。")
             else:
                 print("     (长线)建议: 暂不建议长期持有，关注基本面变化。")
 
