@@ -23,7 +23,7 @@ jobs:
     - name: 安装依赖
       run: |
         python -m pip install --upgrade pip
-        pip install akshare pandas numpy scikit-learn tensorflow optuna
+        pip install akshare pandas numpy scikit-learn mlxtend optuna
     
     - name: 运行选股系统
       run: |
