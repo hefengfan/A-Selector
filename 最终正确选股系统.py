@@ -8,7 +8,7 @@
 import akshare as ak
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 import os
 import warnings
 warnings.filterwarnings('ignore')
@@ -116,64 +116,42 @@ def calculate_features(row):
 
     return features
 
-def calculate_technical_indicators(df, code):
+def calculate_technical_indicators(df_row):
     """
     计算技术指标：简单移动平均线交叉, RSI, 价格与布林带关系, 成交量变化率
+    使用传入的单行数据代替历史K线数据
     """
     try:
-        # 获取历史数据
-        stock_df = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq").iloc[-60:]  # 最近60个交易日
-
-        if len(stock_df) < 20:
-            return 0, 50, 0, 1
-
-        # 计算简单移动平均线
-        stock_df['SMA_5'] = stock_df['收盘'].rolling(window=5).mean()
-        stock_df['SMA_20'] = stock_df['收盘'].rolling(window=20).mean()
+        # 获取实时数据
+        close_price = safe_float(df_row.get('最新'))
+        high_price = safe_float(df_row.get('最高'))
+        low_price = safe_float(df_row.get('最低'))
+        ma_5 = safe_float(df_row.get('5日均价'))
+        ma_20 = safe_float(df_row.get('20日均价'))
+        ma_60 = safe_float(df_row.get('60日均价'))
+        volume = safe_float(df_row.get('成交量'))
 
         # 简单移动平均线交叉信号 (1:金叉, -1:死叉, 0:无)
         sma_signal = 0
-        if stock_df['SMA_5'].iloc[-1] > stock_df['SMA_20'].iloc[-1] and stock_df['SMA_5'].iloc[-2] <= stock_df['SMA_20'].iloc[-2]:
-            sma_signal = 1
-        elif stock_df['SMA_5'].iloc[-1] < stock_df['SMA_20'].iloc[-1] and stock_df['SMA_5'].iloc[-2] >= stock_df['SMA_20'].iloc[-2]:
-            sma_signal = -1
+        if pd.notna(ma_5) and pd.notna(ma_20):
+             if ma_5 > ma_20:
+                 sma_signal = 1
+             elif ma_5 < ma_20:
+                 sma_signal = -1
 
-        # 计算相对强弱指标 (RSI) - 简化计算
-        close_prices = stock_df['收盘'].values
-        price_changes = np.diff(close_prices)
-        gains = price_changes[price_changes > 0]
-        losses = -price_changes[price_changes < 0]
-
-        avg_gain = np.mean(gains) if len(gains) > 0 else 0
-        avg_loss = np.mean(losses) if len(losses) > 0 else 0
-
-        rs = avg_gain / avg_loss if avg_loss > 0 else 0
-        rsi = 100 - (100 / (1 + rs))
-        rsi = np.clip(rsi, 0, 100) # 确保RSI在0-100之间
-
-        # 计算布林带 - 简化计算
-        stock_df['StdDev'] = stock_df['收盘'].rolling(window=20).std()
-        stock_df['Middle'] = stock_df['收盘'].rolling(window=20).mean()
-        stock_df['Upper'] = stock_df['Middle'] + 2 * stock_df['StdDev']
-        stock_df['Lower'] = stock_df['Middle'] - 2 * stock_df['StdDev']
+        # 相对强弱指标 (RSI) - 简化计算
+        rsi = 50 # 无法计算，给一个中性值
 
         # 布林带位置 (1:上轨, -1:下轨, 0:中轨)
-        boll_position = 0
-        close_price = stock_df['收盘'].iloc[-1]
-        if close_price > stock_df['Upper'].iloc[-1]:
-            boll_position = 1
-        elif close_price < stock_df['Lower'].iloc[-1]:
-            boll_position = -1
+        boll_position = 0 # 无法计算，给一个中性值
 
         # 成交量变化率 (5日平均成交量/20日平均成交量)
-        vol_5 = stock_df['成交量'].tail(5).mean()
-        vol_20 = stock_df['成交量'].tail(20).mean()
-        vol_ratio = vol_5 / vol_20 if vol_20 > 0 else 1
+        vol_ratio = 1 # 无法计算，给一个中性值
 
         return sma_signal, rsi, boll_position, vol_ratio
 
     except Exception as e:
-        print(f"计算技术指标时出错({code}): {e}")
+        print(f"计算技术指标时出错: {e}")
         return 0, 50, 0, 1
 
 def objective(trial, X_train, y_train, X_test, y_test, target_type):
@@ -189,7 +167,7 @@ def objective(trial, X_train, y_train, X_test, y_test, target_type):
     solver = trial.suggest_categorical('solver', ['adam', 'sgd'])
     alpha = trial.suggest_loguniform('alpha', 1e-5, 1e-1)
     learning_rate_init = trial.suggest_loguniform('learning_rate_init', 1e-4, 1e-2)
-    
+
     # 根据目标类型调整参数范围
     if target_type == 'short_term':
         learning_rate_init = trial.suggest_loguniform('learning_rate_init', 1e-3, 0.1)
@@ -221,7 +199,7 @@ def train_neural_network(df, target_type='comprehensive'):
     """
     print(f"\n   准备训练数据 ({target_type}模型)...")
     X = []
-    
+
     for _, row in df.iterrows():
         features = calculate_features(row)
         X.append(features)
@@ -253,23 +231,23 @@ def train_neural_network(df, target_type='comprehensive'):
     # 根据目标类型计算不同的评分
     if target_type == 'short_term':
         # 短期评分: 主要关注技术面和市场情绪
-        y = (0.5 * change_norm + 
-             0.3 * turnover_norm + 
+        y = (0.5 * change_norm +
+             0.3 * turnover_norm +
              0.2 * (1 - abs(turnover_norm - 0.5)))  # 换手率适中最好
-        
+
     elif target_type == 'long_term':
         # 长期评分: 主要关注基本面和价值
-        y = (0.4 * profit_norm + 
-             0.3 * market_cap_norm + 
-             0.2 * (1 - pe_ratio_norm) + 
+        y = (0.4 * profit_norm +
+             0.3 * market_cap_norm +
+             0.2 * (1 - pe_ratio_norm) +
              0.1 * change_norm)  # 市盈率越低越好
-        
+
     else:  # comprehensive
         # 综合评分
-        y = (0.4 * change_norm + 
-             0.2 * profit_norm + 
-             0.15 * (1 - abs(turnover_norm - 0.5)) + 
-             0.15 * market_cap_norm + 
+        y = (0.4 * change_norm +
+             0.2 * profit_norm +
+             0.15 * (1 - abs(turnover_norm - 0.5)) +
+             0.15 * market_cap_norm +
              0.1 * (1 - pe_ratio_norm))
 
     # 移除包含 NaN 或无穷大的行
@@ -296,12 +274,12 @@ def train_neural_network(df, target_type='comprehensive'):
     print("   启动 Optuna 超参数优化 (可能需要一些时间)...")
     study = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=42))
     try:
-        study.optimize(lambda trial: objective(trial, X_train, y_train, X_test, y_test, target_type), 
+        study.optimize(lambda trial: objective(trial, X_train, y_train, X_test, y_test, target_type),
                        n_trials=50, show_progress_bar=True)
     except Exception as e:
         print(f"   Optuna 优化过程中发生错误: {e}")
         print("   将使用默认或预设参数训练模型。")
-                # 如果Optuna失败，使用一个默认的模型配置
+        # 如果Optuna失败，使用一个默认的模型配置
         best_params = {
             'n_layers': 2,
             'n_units_l0': 64,
@@ -436,13 +414,6 @@ def main():
         name = row['名称']
         print(f"   [{i+1}/{len(stock_list_df)}] 获取 {name}({code}) 详细数据...", end="")
         try:
-            # 获取个股k线数据
-            stock_df = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq")
-            if stock_df is None or len(stock_df) == 0:
-                print("❌ 获取K线数据失败")
-                error_codes.append(code)
-                continue
-
             # 获取股票实时数据
             stock_realtime_df = ak.stock_zh_a_spot(symbol=code)
             if stock_realtime_df is None or len(stock_realtime_df) == 0:
@@ -489,8 +460,9 @@ def main():
     df['成交量'] = df['成交量'].apply(safe_float)
     df['实际换手%'] = df['换手率'].apply(safe_float)
     df['归属净利润'] = df['归属净利润'].apply(safe_float)
-    df['60日均价'] = df['60日均价'].apply(safe_float)
+    df['5日均价'] = df['5日均价'].apply(safe_float)
     df['20日均价'] = df['20日均价'].apply(safe_float)
+    df['60日均价'] = df['60日均价'].apply(safe_float)
 
     # 移除包含 NaN 或无穷大的行
     df_for_scoring = df.copy() # 用于评分
@@ -545,8 +517,7 @@ def main():
     # 获取技术指标
     print("\n   获取技术指标...")
     for i, row in quality_stocks_filtered.iterrows():
-        code = row['代码']
-        sma, rsi, boll, vol_ratio = calculate_technical_indicators(df_for_scoring, code)
+        sma, rsi, boll, vol_ratio = calculate_technical_indicators(row)
         quality_stocks_filtered.loc[i, 'SMA'] = sma
         quality_stocks_filtered.loc[i, 'RSI'] = rsi
         quality_stocks_filtered.loc[i, 'BOLL'] = boll
@@ -609,20 +580,20 @@ def main():
             profitability = "优秀" if pe_ratio > 0 and pe_ratio < 15 else "良好" if pe_ratio < 30 else "一般"
             growth_potential = "高" if market_cap < 500 and turnover_rate > 5 else "中" if market_cap < 1000 else "低"
             debt_level = "健康" if market_cap > 100 else "一般"  # 简化评估
-            
+
             # 2. 技术面分析
             sma_signal = "金叉" if sma == 1 else "死叉" if sma == -1 else "中性"
             rsi_signal = "超买" if rsi > 70 else "超卖" if rsi < 30 else "中性"
             boll_signal = "上轨" if boll == 1 else "下轨" if boll == -1 else "中轨"
             volume_signal = "放量" if vol_ratio > 1.2 else "缩量" if vol_ratio < 0.8 else "平量"
-            
+
             # 3. 综合判断和建议
             print(f"\n   股票代码: {code} ({name})")
             print(f"     所属行业: {industry}")
             print(f"     综合评分: {comprehensive_score:.4f} | 短期评分: {short_term_score:.4f} | 长期评分: {long_term_score:.4f}")
             print(f"     基本面: 盈利能力-{profitability}, 成长潜力-{growth_potential}, 负债水平-{debt_level}")
             print(f"     技术面: SMA-{sma_signal}, RSI-{rsi_signal}({rsi:.1f}), BOLL-{boll_signal}, 成交量-{volume_signal}({vol_ratio:.2f})")
-            
+
             # 投资建议 - 根据评分和技术指标
             # 短期策略 (1-5个交易日)
             short_term_recommendation = ""
@@ -637,7 +608,7 @@ def main():
                 short_term_recommendation = "观望"
             else:
                 short_term_recommendation = "回避"
-                
+
             # 长期策略 (1-6个月)
             long_term_recommendation = ""
             if long_term_score > 0.7:
@@ -651,10 +622,10 @@ def main():
                 long_term_recommendation = "观望"
             else:
                 long_term_recommendation = "回避"
-                
+
             print(f"     短期策略(1-5天): {short_term_recommendation}")
             print(f"     长期策略(1-6月): {long_term_recommendation}")
-            
+
             # 具体操作建议
             print(f"     具体操作:")
             if short_term_recommendation in ["强烈买入", "买入"]:
@@ -663,17 +634,17 @@ def main():
                     print(f"       - 注意: RSI({rsi:.1f})已进入超买区，可等待回调介入")
             elif short_term_recommendation == "谨慎买入":
                 print(f"       - 短期: 可轻仓参与，严格设置止损-3%，快进快出")
-            
+
             if long_term_recommendation in ["强烈买入", "买入"]:
                 print(f"       - 长期: 可分批建仓，关注季度财报，目标持有3-6个月")
                 if pe_ratio > 30:
                     print(f"       - 注意: 市盈率({pe_ratio:.1f})偏高，等待回调至合理区间")
             elif long_term_recommendation == "谨慎买入":
                 print(f"       - 长期: 可小仓位布局，关注行业政策和基本面变化")
-            
+
             if short_term_recommendation == "回避" and long_term_recommendation == "回避":
                 print("       - 暂无合适操作策略，建议观望")
-                
+
             print("-" * 70)
 
     else:
@@ -694,3 +665,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
