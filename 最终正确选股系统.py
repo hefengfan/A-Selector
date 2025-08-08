@@ -3,17 +3,15 @@
 """
 动态选股系统 - 根据每天实时数据筛选
 基于苏氏量化策略的真实计算逻辑
-集成更精密的算法 (XGBoost) 进行精准评分
+集成神经网络进行精准评分
 新增：
-1. 使用 Optuna 进行 XGBoost 超参数优化，提升评分精度和区分度。
+1. 使用 Optuna 进行神经网络超参数优化，提升评分精度和区分度。
 2. 引入关联规则挖掘，分析哪些条件组合更容易产生高收益，提供策略洞察。
 3. 优化数据处理和输出展示。
 4. 优化代码准确性、质量和效率。
 5. 使用复合质量评分作为神经网络的目标变量，提高模型准确性。
-6. 引入更多技术和财务指标作为模型特征。
-7. 根据模型评分和规则生成明确的“短期买入”、“长期买入”和“规避”策略信号。
-8. 提供模型特征重要性评估。
-9. 策略推荐给出多特征组合，更具指导性。
+6. 集成 XGBoost 和 TA-Lib 进行特征工程和模型训练。
+7. 基于特征和预测结果，提供短期/长期买入/卖出策略建议。
 """
 
 import akshare as ak
@@ -24,11 +22,11 @@ import os
 import warnings
 warnings.filterwarnings('ignore')
 
-# 导入机器学习相关库
+# 导入神经网络相关库
+from sklearn.neural_network import MLPRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, r2_score
-import xgboost as xgb # 使用XGBoost
 
 # 导入 Optuna 进行超参数优化
 import optuna
@@ -36,6 +34,12 @@ import optuna
 # 导入 mlxtend 进行关联规则挖掘
 from mlxtend.frequent_patterns import apriori, association_rules
 from mlxtend.preprocessing import TransactionEncoder
+
+# 导入 XGBoost
+import xgboost as xgb
+
+# 导入 TA-Lib (如果未安装，请先安装：pip install TA-Lib)
+import talib
 
 # 清除代理设置
 os.environ['HTTP_PROXY'] = ''
@@ -53,185 +57,200 @@ def safe_float(value_str):
             return np.nan
         # 处理带单位的字符串
         if '亿' in s:
-            return float(s.replace('亿', '')) * 100000000 # 1亿 = 10^8
+            return float(s.replace('亿', '')) * 10000
         if '万亿' in s:
-            return float(s.replace('万亿', '')) * 1000000000000 # 1万亿 = 10^12
+            return float(s.replace('万亿', '')) * 100000000
         if '万' in s:
-            return float(s.replace('万', '')) * 10000 # 1万 = 10^4
-        if '%' in s: # 处理百分比
-            return float(s.replace('%', ''))
+            return float(s.replace('万', '')) / 10000
         return float(s)
     except ValueError:
         return np.nan
 
-def get_model_features(row):
+def calculate_features(row):
     """
-    根据苏氏量化策略和更多指标计算特征值，用于神经网络训练。
+    根据苏氏量化策略计算特征值，用于神经网络训练和关联规则挖掘。
     返回一个包含数值特征的列表。
     """
     features = []
 
-    # 核心苏氏策略特征 (0或1)
-    # F列：价格位置条件
-    low = safe_float(row.get('最低'))
-    ma60 = safe_float(row.get('60日均价'))
-    ma20 = safe_float(row.get('20日均价'))
-    current = safe_float(row.get('最新'))
+    # F列：价格位置条件 (0或1)
+    try:
+        low = safe_float(row.get('最低'))
+        ma60 = safe_float(row.get('60日均价'))
+        ma20 = safe_float(row.get('20日均价'))
+        current = safe_float(row.get('最新'))
 
-    f_condition = 0
-    if pd.notna(low) and pd.notna(ma60) and ma60 > 0 and 0.85 <= low / ma60 <= 1.15:
-        f_condition = 1
-    elif pd.notna(current) and pd.notna(ma20) and ma20 > 0 and 0.90 <= current / ma20 <= 1.10:
-        f_condition = 1
-    features.append(f_condition) # Feature 0: F_价格位置
+        f_condition = 0
+        if pd.notna(low) and pd.notna(ma60) and ma60 > 0 and 0.85 <= low / ma60 <= 1.15:
+            f_condition = 1
+        elif pd.notna(current) and pd.notna(ma20) and ma20 > 0 and 0.90 <= current / ma20 <= 1.10:
+            f_condition = 1
+        features.append(f_condition)
+    except:
+        features.append(0) # 默认值
 
-    # G列：涨幅和价格位置
-    change = safe_float(row.get('涨幅%'))
-    high = safe_float(row.get('最高'))
-    # low = safe_float(row.get('最低')) # low已在上面获取
+    # G列：涨幅和价格位置 (0或1)
+    try:
+        change = safe_float(row.get('涨幅%'))
+        current = safe_float(row.get('最新'))
+        high = safe_float(row.get('最高'))
+        low = safe_float(row.get('最低'))
 
-    g_condition = 0
-    if pd.notna(change) and change >= 5.0 and pd.notna(current) and pd.notna(high) and pd.notna(low):
-        if (high - low) > 0:
-            threshold = high - (high - low) * 0.30
-            if current >= threshold:
+        g_condition = 0
+        if pd.notna(change) and change >= 5.0 and pd.notna(current) and pd.notna(high) and pd.notna(low):
+            if (high - low) > 0: # 避免除以零
+                threshold = high - (high - low) * 0.30
+                if current >= threshold:
+                    g_condition = 1
+            elif current == high: # 如果最高最低相同，且涨幅>=5，也算满足
                 g_condition = 1
-        elif current == high: # 如果最高最低相同，且涨幅>=5，也算满足
-            g_condition = 1
-    features.append(g_condition) # Feature 1: G_涨幅位置
+        features.append(g_condition)
+    except:
+        features.append(0) # 默认值
 
-    # 更多技术指标特征 (数值)
-    # 价格相对均线位置
-    features.append(current / ma20 if pd.notna(current) and pd.notna(ma20) and ma20 > 0 else 1.0) # Feature 2: 价格_vs_MA20
-    features.append(current / ma60 if pd.notna(current) and pd.notna(ma60) and ma60 > 0 else 1.0) # Feature 3: 价格_vs_MA60
-    features.append(ma20 / ma60 if pd.notna(ma20) and pd.notna(ma60) and ma60 > 0 else 1.0) # Feature 4: MA20_vs_MA60
+    # H列：归属净利润 (数值，单位亿)
+    try:
+        profit = safe_float(row.get('归属净利润'))
+        features.append(profit if pd.notna(profit) else 0)
+    except:
+        features.append(0)
 
-    # 每日波动幅度
-    daily_range_ratio = (high - low) / current if pd.notna(high) and pd.notna(low) and pd.notna(current) and current > 0 else 0.0
-    features.append(daily_range_ratio) # Feature 5: 日内波动率
+    # I列：实际换手率 (数值)
+    try:
+        turnover = safe_float(row.get('实际换手%'))
+        features.append(turnover if pd.notna(turnover) else 100) # 缺失时给一个较大值
+    except:
+        features.append(100)
 
-    # 收盘价在日内区间的位置 (越接近最高价越强)
-    close_pos_in_range = (current - low) / (high - low) if pd.notna(current) and pd.notna(low) and pd.notna(high) and (high - low) > 0 else 0.5
-    features.append(close_pos_in_range) # Feature 6: 收盘价_日内位置
-
-    # 财务与市场指标特征 (数值)
-    profit = safe_float(row.get('归属净利润')) # 单位是亿，这里保持原值
-    features.append(profit if pd.notna(profit) else 0) # Feature 7: 归属净利润
-
-    turnover = safe_float(row.get('实际换手%'))
-    features.append(turnover if pd.notna(turnover) else 0) # Feature 8: 实际换手率
-
-    market_cap = safe_float(row.get('总市值')) # 单位是亿，这里保持原值
-    features.append(market_cap if pd.notna(market_cap) else 0) # Feature 9: 总市值
-
-    pe_ratio = safe_float(row.get('市盈率(动)'))
-    features.append(pe_ratio if pd.notna(pe_ratio) else 1000) # Feature 10: 市盈率(动) (缺失时给一个大值，表示高估)
-
-    # 成交额 (单位是亿)
-    turnover_value = safe_float(row.get('成交额')) # akshare返回的是亿，这里保持原值
-    features.append(turnover_value if pd.notna(turnover_value) else 0) # Feature 11: 成交额
-
-    # 涨幅%
-    features.append(change if pd.notna(change) else 0) # Feature 12: 涨幅%
+    # J列：总市值 (数值，单位亿)
+    try:
+        cap = safe_float(row.get('总市值'))
+        features.append(cap if pd.notna(cap) else 0)
+    except:
+        features.append(0)
 
     return features
 
+def add_technical_indicators(df):
+    """
+    使用 TA-Lib 添加技术指标特征。
+    """
+    # 确保所需的列存在且为数值类型
+    for col in ['最新', '最高', '最低', '开盘', '昨收']:
+        if col not in df.columns:
+            df[col] = np.nan
+        df[col] = df[col].apply(safe_float)
+
+    # 确保数据按时间顺序排列(如果适用)
+    # df = df.sort_index(ascending=True)
+
+    # 简单移动平均线 (SMA)
+    df['SMA_5'] = talib.SMA(df['最新'], timeperiod=5)
+    df['SMA_20'] = talib.SMA(df['最新'], timeperiod=20)
+
+    # 指数移动平均线 (EMA)
+    df['EMA_12'] = talib.EMA(df['最新'], timeperiod=12)
+    df['EMA_26'] = talib.EMA(df['最新'], timeperiod=26)
+
+    # 相对强弱指标 (RSI)
+    df['RSI'] = talib.RSI(df['最新'], timeperiod=14)
+
+    # 移动平均收敛/发散 (MACD)
+    macd, macdsignal, macdhist = talib.MACD(df['最新'], fastperiod=12, slowperiod=26, signalperiod=9)
+    df['MACD'] = macd
+    df['MACD_SIGNAL'] = macdsignal
+    df['MACD_HIST'] = macdhist
+
+    # 布林带 (Bollinger Bands)
+    upper, middle, lower = talib.BBANDS(df['最新'], timeperiod=20, nbdevup=2, nbdevdn=2, matype=0)
+    df['BB_UPPER'] = upper
+    df['BB_MIDDLE'] = middle
+    df['BB_LOWER'] = lower
+
+    # 成交量指标 (例如，成交量变化率)
+    # 确保 '实际换手%' 列存在且为数值类型
+    if '实际换手%' not in df.columns:
+        df['实际换手%'] = np.nan
+    df['实际换手%'] = df['实际换手%'].apply(safe_float)
+
+    df['VOLUME_CHG'] = df['实际换手%'].diff()
+
+    # 动量指标 (例如，动量变化率)
+    df['MOM'] = talib.MOM(df['最新'], timeperiod=10)
+
+    return df
+
 def objective(trial, X_train, y_train, X_test, y_test):
     """
-    Optuna 优化目标函数 for XGBoost
+    Optuna 优化目标函数 (XGBoost)
     """
-    param = {
-        'objective': 'reg:squarederror',
+    params = {
+        'objective': 'reg:squarederror',  # 回归任务
         'eval_metric': 'rmse',
         'booster': trial.suggest_categorical('booster', ['gbtree', 'gblinear', 'dart']),
         'lambda': trial.suggest_loguniform('lambda', 1e-8, 1.0),
         'alpha': trial.suggest_loguniform('alpha', 1e-8, 1.0),
-        'subsample': trial.suggest_uniform('subsample', 0.5, 1.0),
-        'colsample_bytree': trial.suggest_uniform('colsample_bytree', 0.5, 1.0),
-        'seed': 42,
-        'n_jobs': -1,
+        'learning_rate': trial.suggest_loguniform('learning_rate', 0.005, 0.1),
+        'random_state': 42,
     }
 
-    if param['booster'] == 'gbtree' or param['booster'] == 'dart':
-        param['max_depth'] = trial.suggest_int('max_depth', 3, 9)
-        param['eta'] = trial.suggest_loguniform('eta', 1e-8, 1.0)
-        param['gamma'] = trial.suggest_loguniform('gamma', 1e-8, 1.0)
-        param['grow_policy'] = trial.suggest_categorical('grow_policy', ['depthwise', 'lossguide'])
+    if params['booster'] == 'gbtree' or params['booster'] == 'dart':
+        params['max_depth'] = trial.suggest_int('max_depth', 3, 9)
+        params['min_child_weight'] = trial.suggest_int('min_child_weight', 1, 10)
+        params['subsample'] = trial.suggest_float('subsample', 0.5, 1.0)
+        params['colsample_bytree'] = trial.suggest_float('colsample_bytree', 0.5, 1.0)
+        params['colsample_bylevel'] = trial.suggest_float('colsample_bylevel', 0.5, 1.0)
+    elif params['booster'] == 'gblinear':
+        params['updater'] = trial.suggest_categorical('updater', ['coord_descent', 'shotgun'])
 
-    if param['booster'] == 'dart':
-        param['sample_type'] = trial.suggest_categorical('sample_type', ['uniform', 'weighted'])
-        param['normalize_type'] = trial.suggest_categorical('normalize_type', ['tree', 'forest'])
-        param['rate_drop'] = trial.suggest_uniform('rate_drop', 0.0, 1.0)
-        param['skip_drop'] = trial.suggest_uniform('skip_drop', 0.0, 1.0)
-
-    model = xgb.XGBRegressor(**param)
-    model.fit(X_train, y_train,
-              eval_set=[(X_test, y_test)],
-              early_stopping_rounds=50, # 增加耐心
-              verbose=False)
-
+    model = xgb.XGBRegressor(**params)
+    model.fit(X_train, y_train, eval_set=[(X_test, y_test)], early_stopping_rounds=50, verbose=False)
     y_pred = model.predict(X_test)
-    mse = mean_squared_error(y_test, y_pred)
-    return mse # Optuna 默认最小化目标
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred))  # 使用 RMSE
+    return rmse
 
 def train_xgboost_model(df):
     """
     训练 XGBoost 模型，预测股票评分，使用 Optuna 进行超参数优化。
     使用复合质量评分作为目标变量。
     """
-    print("\n   准备训练数据...")
+    print("\n   准备训练数据 (XGBoost)...")
     X = []
+
     for _, row in df.iterrows():
-        features = get_model_features(row)
+        features = calculate_features(row)
         X.append(features)
 
     X = np.array(X)
 
-    # 提取用于计算质量评分的列 (原始数值，未格式化)
+    # 提取用于计算质量评分的列
     change = df['涨幅%'].apply(safe_float)
     profit = df['归属净利润'].apply(safe_float)
     turnover = df['实际换手%'].apply(safe_float)
     market_cap = df['总市值'].apply(safe_float)
     pe_ratio = df['市盈率(动)'].apply(safe_float)
-    current_price = df['最新'].apply(safe_float)
-    ma20 = df['20日均价'].apply(safe_float)
 
-    # 归一化各个指标 (使用 min-max 归一化，处理NaN)
-    # 对于涨幅、净利润、市值，越大越好
-    change_norm = (change - change.min()) / (change.max() - change.min()) if change.max() != change.min() else 0
-    profit_norm = (profit - profit.min()) / (profit.max() - profit.min()) if profit.max() != profit.min() else 0
-    market_cap_norm = (market_cap - market_cap.min()) / (market_cap.max() - market_cap.min()) if market_cap.max() != market_cap.min() else 0
-
-    # 换手率：适中最好，偏离0.5越远越差
-    turnover_norm = (turnover - turnover.min()) / (turnover.max() - turnover.min()) if turnover.max() != turnover.min() else 0
-    turnover_score = 1 - abs(turnover_norm - 0.5) * 2 # 0.5时为1，0或1时为0
-
-    # 市盈率：越低越好，但要避免负值和过高值
-    pe_ratio_capped = pe_ratio.apply(lambda x: min(x, 100) if x > 0 else 100) # 将过高或负的市盈率限制在合理范围
-    pe_ratio_norm = (pe_ratio_capped - pe_ratio_capped.min()) / (pe_ratio_capped.max() - pe_ratio_capped.min()) if pe_ratio_capped.max() != pe_ratio_capped.min() else 0
-    pe_score = 1 - pe_ratio_norm
-
-    # 价格相对20日均线位置：越接近均线越好，但略高于均线更佳
-    price_ma20_ratio = current_price / ma20
-    # 之前有错，现在修正
-    price_ma20_ratio_score = price_ma20_ratio.apply(lambda x: max(0, 1 - abs(x - 1))) # 越接近1分越高，但不能为负
+    # 归一化各个指标 (使用 min-max 归一化)
+    change_norm = (change - change.min()) / (change.max() - change.min())
+    profit_norm = (profit - profit.min()) / (profit.max() - profit.min())
+    turnover_norm = (turnover - turnover.min()) / (turnover.max() - turnover.min())
+    market_cap_norm = (market_cap - market_cap.min()) / (market_cap.max() - market_cap.min())
+    pe_ratio_norm = (pe_ratio - pe_ratio.min()) / (pe_ratio.max() - pe_ratio.min())
 
     # 处理 NaN 值，用 0 填充
     change_norm = change_norm.fillna(0)
     profit_norm = profit_norm.fillna(0)
-    turnover_score = turnover_score.fillna(0)
+    turnover_norm = turnover_norm.fillna(0)
     market_cap_norm = market_cap_norm.fillna(0)
-    pe_score = pe_score.fillna(0)
-    price_ma20_ratio_score = price_ma20_ratio_score.fillna(0)
+    pe_ratio_norm = pe_ratio_norm.fillna(0)
 
     # 计算复合质量评分 (可以调整权重)
     df['quality_score'] = (
-        0.25 * change_norm +
-        0.20 * profit_norm +
-        0.15 * turnover_score +
-        0.15 * market_cap_norm +
-        0.15 * pe_score +
-        0.10 * price_ma20_ratio_score
+        0.3 * change_norm +  # 涨幅
+        0.25 * profit_norm +  # 净利润
+        0.15 * (1 - abs(turnover_norm - 0.5)) +  # 换手率 (适中最好)
+        0.2 * market_cap_norm +  # 市值
+        0.1 * (1 - pe_ratio_norm)  # 市盈率 (越低越好)
     )
 
     y = df['quality_score'].values
@@ -242,10 +261,22 @@ def train_xgboost_model(df):
     y = y[mask]
 
     if len(X) < 20: # 至少需要一些数据来划分训练集和测试集
-        print("   ❌ 有效训练数据不足，无法训练模型。")
-        return None, None, None # 返回模型、Scaler、特征名称
+        print("   ❌ 有效训练数据不足，无法训练 XGBoost 模型。")
+        return None, None
 
-    print(f"   有效训练样本数: {len(X)}")
+    print(f"   有效训练样本数 (XGBoost): {len(X)}")
+
+    # 添加技术指标
+    print("   添加技术指标特征...")
+    df = add_technical_indicators(df.copy()) # 使用副本，避免修改原始数据
+    technical_indicators = [col for col in df.columns if col.startswith(('SMA', 'EMA', 'RSI', 'MACD', 'BB', 'VOLUME', 'MOM'))]
+
+    # 提取技术指标特征
+    X_technical = df[technical_indicators].values
+    X_technical = X_technical[mask] # 应用相同的 mask
+
+    # 合并基本特征和技术指标特征
+    X = np.concatenate((X, X_technical), axis=1)
 
     # 数据预处理
     print("   数据预处理 (StandardScaler)...")
@@ -257,12 +288,12 @@ def train_xgboost_model(df):
     X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
 
     # Optuna 超参数优化
-    print("   启动 Optuna 超参数优化 (可能需要一些时间)...")
+    print("   启动 Optuna 超参数优化 (XGBoost, 可能需要一些时间)...")
     study = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=42))
     try:
-        study.optimize(lambda trial: objective(trial, X_train, y_train, X_test, y_test), n_trials=50, show_progress_bar=True)
+        study.optimize(lambda trial: objective(trial, X_train, y_train, X_test, y_test), n_trials=30, show_progress_bar=True) # 减少 trials
     except Exception as e:
-        print(f"   Optuna 优化过程中发生错误: {e}")
+        print(f"   Optuna 优化过程中发生错误 (XGBoost): {e}")
         print("   将使用默认或预设参数训练模型。")
         # 如果Optuna失败，使用一个合理的默认配置
         best_params = {
@@ -271,28 +302,27 @@ def train_xgboost_model(df):
             'booster': 'gbtree',
             'lambda': 1.0,
             'alpha': 0.0,
+            'learning_rate': 0.1,
+            'max_depth': 6,
+            'min_child_weight': 1,
             'subsample': 0.8,
             'colsample_bytree': 0.8,
-            'max_depth': 6,
-            'eta': 0.1,
-            'gamma': 0.0,
-            'grow_policy': 'depthwise',
-            'seed': 42,
-            'n_jobs': -1,
+            'colsample_bylevel': 0.8,
+            'random_state': 42
         }
     else:
-        print("\n   Optuna 优化完成。")
-        print(f"   最佳均方误差 (MSE): {study.best_value:.4f}")
+        print("\n   Optuna 优化完成 (XGBoost)。")
+        print(f"   最佳 RMSE: {study.best_value:.4f}")
         print(f"   最佳超参数: {study.best_params}")
         best_params = study.best_params
+        best_params['objective'] = 'reg:squarederror'
+        best_params['eval_metric'] = 'rmse'
+        best_params['random_state'] = 42
 
     # 使用最佳参数训练最终模型
     print("   使用最佳参数训练最终 XGBoost 模型...")
     model = xgb.XGBRegressor(**best_params)
-    model.fit(X_train, y_train,
-              eval_set=[(X_test, y_test)],
-              early_stopping_rounds=100, # 增加耐心
-              verbose=False)
+    model.fit(X_train, y_train, eval_set=[(X_test, y_test)], early_stopping_rounds=50, verbose=False)
 
     # 评估模型
     print("   评估最终模型...")
@@ -302,162 +332,159 @@ def train_xgboost_model(df):
     print(f"   最终模型均方误差 (MSE): {mse:.4f}")
     print(f"   最终模型R²分数: {r2:.4f}")
 
-    # 获取特征名称 (与get_model_features中的顺序一致)
-    feature_names = [
-        "F_价格位置", "G_涨幅位置", "价格_vs_MA20", "价格_vs_MA60", "MA20_vs_MA60",
-        "日内波动率", "收盘价_日内位置", "归属净利润", "实际换手率", "总市值", "市盈率(动)",
-        "成交额", "涨幅%"
-    ]
+    return model, scaler, technical_indicators
 
-    return model, scaler, feature_names
-
-def predict_score_with_model(row, model, scaler):
+def predict_score_with_xgboost(row, model, scaler, technical_indicators, df):
     """
-    使用训练好的模型预测股票评分
+    使用训练好的 XGBoost 模型预测股票评分
     """
-    features = get_model_features(row)
-    if any(pd.isna(f) or np.isinf(f) for f in features):
-        return np.nan
+    features = calculate_features(row)
 
-    features = np.array(features).reshape(1, -1)
+    # 添加技术指标
+    row_df = pd.DataFrame([row])  # 将行转换为 DataFrame
+    row_df = add_technical_indicators(row_df)  # 添加技术指标
+
+    # 提取技术指标值
+    technical_values = row_df[technical_indicators].values.flatten().tolist()
+
+    # 合并基本特征和技术指标
+    features.extend(technical_values)
+    features = np.array(features).reshape(1, -1)  # 转换为二维数组
+
+    # 检查特征中是否有NaN或Inf，如果有，则返回一个默认值或NaN
+    if any(pd.isna(f) or np.isinf(f) for f in features.flatten()):
+        return np.nan  # 或者一个非常低的默认分数
+
     try:
         features_scaled = scaler.transform(features)
         score = model.predict(features_scaled)[0]
         return score
     except Exception as e:
         # print(f"预测分数时发生错误: {e}, 特征: {features}")
-        return np.nan
+        return np.nan  # 预测失败时返回NaN
 
-def generate_strategy_signals(stock_data, nn_score):
+def generate_trading_strategy(stock, df, model, scaler, technical_indicators):
     """
-    根据股票数据和神经网络评分生成策略信号。
+    基于股票特征和预测结果，生成交易策略建议。
     """
-    signals = []
-    current = safe_float(stock_data.get('最新'))
-    change = safe_float(stock_data.get('涨幅%'))
-    turnover = safe_float(stock_data.get('实际换手%'))
-    ma20 = safe_float(stock_data.get('20日均价'))
-    ma60 = safe_float(stock_data.get('60日均价'))
-    pe_ratio = safe_float(stock_data.get('市盈率(动)'))
-    profit = safe_float(stock_data.get('归属净利润'))
-    market_cap = safe_float(stock_data.get('总市值'))
-    high = safe_float(stock_data.get('最高'))
-    low = safe_float(stock_data.get('最低'))
-    成交额 = safe_float(stock_data.get('成交额'))
+    code = stock['代码']
+    stock_row = df[df['原始代码'] == code].iloc[0]  # 获取股票的完整行数据
 
-    # 短期买入信号条件列表
-    short_term_buy_conditions = []
-    if pd.notna(nn_score) and nn_score > 0.7:
-        short_term_buy_conditions.append("NN高分(>0.7)")
-    if pd.notna(change) and change >= 2.0:
-        short_term_buy_conditions.append(f"涨幅积极(>={change:.2f}%)")
-    if pd.notna(current) and pd.notna(ma20) and ma20 > 0 and current > ma20 * 1.01:
-        short_term_buy_conditions.append("站上20MA(>1.01倍)")
-    if pd.notna(turnover) and 1.0 < turnover < 15.0:
-        short_term_buy_conditions.append(f"换手适中({turnover:.2f}%)")
-    if pd.notna(current) and pd.notna(high) and pd.notna(low) and (high - low) > 0 and (current - low) / (high - low) > 0.7:
-        short_term_buy_conditions.append("收盘强势(近高点)")
-    if pd.notna(成交额) and 成交额 > 5.0: # 成交额大于5亿
-        short_term_buy_conditions.append(f"成交活跃(>{成交额:.2f}亿)")
+    # 获取股票的详细数据
+    current_price = safe_float(stock_row['最新'])
+    change_percent = safe_float(stock_row['涨幅%'])
+    volume = safe_float(stock_row['实际换手%'])
+    market_cap = safe_float(stock_row['总市值'])
+    quality_score = stock['优质率']
 
-    # 判断短期买入信号
-    if len(short_term_buy_conditions) >= 3: # 满足至少3个条件
-        signals.append(f"短期买入 ({', '.join(short_term_buy_conditions)})")
+    # 技术指标分析
+    sma_5 = safe_float(stock_row.get('SMA_5', np.nan))
+    sma_20 = safe_float(stock_row.get('SMA_20', np.nan))
+    rsi = safe_float(stock_row.get('RSI', np.nan))
+    macd = safe_float(stock_row.get('MACD', np.nan))
+    macd_signal = safe_float(stock_row.get('MACD_SIGNAL', np.nan))
 
-    # 长期买入信号条件列表
-    long_term_buy_conditions = []
-    if pd.notna(nn_score) and nn_score > 0.6:
-        long_term_buy_conditions.append("NN中高分(>0.6)")
-    if pd.notna(pe_ratio) and 0 < pe_ratio < 40:
-        long_term_buy_conditions.append(f"PE合理({pe_ratio:.2f})")
-    if pd.notna(profit) and profit > 0.5: # 归属净利润大于5000万 (0.5亿)
-        long_term_buy_conditions.append(f"净利润良好(>{profit:.2f}亿)")
-    if pd.notna(market_cap) and market_cap > 100: # 总市值大于100亿
-        long_term_buy_conditions.append(f"市值较大(>{market_cap:.2f}亿)")
-    if pd.notna(current) and pd.notna(ma60) and ma60 > 0 and current > ma60 * 0.95:
-        long_term_buy_conditions.append("价格近60MA(>0.95倍)")
-    if pd.notna(ma20) and pd.notna(ma60) and ma60 > 0 and ma20 > ma60: # 20日均线在60日均线之上
-        long_term_buy_conditions.append("均线多头排列(20MA>60MA)")
+    # 基本面分析
+    profit = safe_float(stock_row['归属净利润'])
+    pe_ratio = safe_float(stock_row['市盈率(动)'])
 
-    # 判断长期买入信号
-    if len(long_term_buy_conditions) >= 3: # 满足至少3个条件
-        signals.append(f"长期买入 ({', '.join(long_term_buy_conditions)})")
+    strategy = {
+        '代码': code,
+        '名称': stock['名称'],
+        '建议': '持有观望',  # 默认建议
+        '理由': [],
+        '仓位': '轻仓', # 默认轻仓
+        '止损': None,
+        '止盈': None,
+        '周期': '短期' # 默认短期
+    }
 
-    # 规避/警示信号条件列表
-    avoid_conditions = []
-    if pd.notna(change) and change < -5.0:
-        avoid_conditions.append(f"大幅下跌(<{change:.2f}%)")
-    if pd.notna(turnover) and turnover > 25.0:
-        avoid_conditions.append(f"换手过高(>{turnover:.2f}%)")
-    if pd.notna(pe_ratio) and (pe_ratio < 0 or pe_ratio > 150):
-        avoid_conditions.append(f"PE异常({pe_ratio:.2f})")
-    if pd.notna(profit) and profit < 0:
-        avoid_conditions.append(f"净利润为负({profit:.2f}亿)")
-    if pd.notna(current) and pd.notna(ma20) and ma20 > 0 and current < ma20 * 0.95:
-        avoid_conditions.append("跌破20MA(<0.95倍)")
-    if pd.notna(market_cap) and market_cap < 30: # 总市值小于30亿
-        avoid_conditions.append(f"市值过小(<{market_cap:.2f}亿)")
+    # 短期策略 (1-5天)
+    if change_percent > 3 and volume > 5:
+        strategy['周期'] = '短期'
+        if current_price > sma_5 and macd > macd_signal:
+            strategy['建议'] = '谨慎买入'
+            strategy['理由'].append('短期均线呈上升趋势')
+            strategy['理由'].append('MACD金叉')
+            strategy['仓位'] = '中仓'
+            strategy['止损'] = current_price * 0.98 # 2% 止损
+            strategy['止盈'] = current_price * 1.05 # 5% 止盈
+        elif rsi > 70:
+            strategy['建议'] = '不建议追高'
+            strategy['理由'].append('RSI过高，可能超买')
+        else:
+            strategy['建议'] = '持有观望'
+            strategy['理由'].append('短期趋势不明朗')
 
-    # 判断规避/警示信号
-    if len(avoid_conditions) >= 2: # 满足至少2个条件
-        signals.append(f"规避/警示 ({', '.join(avoid_conditions)})")
+    # 长期策略 (1个月以上)
+    elif quality_score > 0.7 and profit > 0 and pe_ratio > 0 and pe_ratio < 30:
+        strategy['周期'] = '长期'
+        strategy['建议'] = '逢低买入'
+        strategy['理由'].append('基本面良好，盈利稳定')
+        strategy['理由'].append('市盈率合理')
+        strategy['仓位'] = '小仓位'
+        strategy['止损'] = current_price * 0.9 # 10% 止损
+        strategy['止盈'] = None  # 长期投资不设止盈
 
-    if not signals:
-        signals.append("无明确信号")
+    # 风险控制
+    elif change_percent < -3 or volume > 20:
+        strategy['建议'] = '谨慎，注意风险'
+        strategy['理由'].append('今日跌幅较大或换手率过高')
+        strategy['仓位'] = '空仓'
 
-    return "; ".join(signals)
+    # 补充理由
+    if quality_score > 0.8:
+        strategy['理由'].append('神经网络评分高')
+    elif quality_score < 0.3:
+        strategy['理由'].append('神经网络评分低')
+
+    return strategy
 
 def perform_association_rule_mining(df):
     """
-    使用关联规则挖掘来发现苏氏量化策略条件与高收益之间的关系。
+    使用关联规则挖掘来发现苏氏量化策略条件与高涨幅之间的关系。
     """
     print("\n4. 执行关联规则挖掘...")
 
-    # 准备数据：将特征和目标变量离散化
+    # 准备数据：将特征和目标变量二值化
     data_for_ar = []
     for _, row in df.iterrows():
-        # 使用 get_model_features 获取原始数值特征
-        raw_features = get_model_features(row)
+        features = calculate_features(row)
         items = []
 
-        # 苏氏策略特征
-        if raw_features[0] == 1: items.append("F_价格位置_满足")
-        else: items.append("F_价格位置_不满足")
+        # F列：价格位置条件
+        if features[0] == 1:
+            items.append("F_价格位置_满足")
+        else:
+            items.append("F_价格位置_不满足")
 
-        if raw_features[1] == 1: items.append("G_涨幅位置_满足")
-        else: items.append("G_涨幅位置_不满足")
+        # G列：涨幅和价格位置
+        if features[1] == 1:
+            items.append("G_涨幅位置_满足")
+        else:
+            items.append("G_涨幅位置_不满足")
 
-        # 归属净利润 (Feature 7): 分为高、中、低三档
-        profit = raw_features[7]
-        if profit >= 10: items.append("H_净利润_高(>=10亿)")
-        elif 1 <= profit < 10: items.append("H_净利润_中(1-10亿)")
-        else: items.append("H_净利润_低(<1亿)")
+        # H列：净利润>=3000万 (0.3亿)
+        if features[2] >= 0.3:
+            items.append("H_净利润_高")
+        else:
+            items.append("H_净利润_低")
 
-        # 实际换手率 (Feature 8): 分为高、低两档
-        turnover = raw_features[8]
-        if turnover >= 10: items.append("I_换手率_高(>=10%)")
-        else: items.append("I_换手率_低(<10%)")
+        # I列：换手率<=20%
+        if features[3] <= 20:
+            items.append("I_换手率_低")
+        else:
+            items.append("I_换手率_高")
 
-        # 总市值 (Feature 9): 分为大、中、小三档
-        market_cap = raw_features[9]
-        if market_cap >= 500: items.append("J_市值_大(>=500亿)")
-        elif 100 <= market_cap < 500: items.append("J_市值_中(100-500亿)")
-        else: items.append("J_市值_小(<100亿)")
+        # J列：市值>=300亿
+        if features[4] >= 300:
+            items.append("J_市值_大")
+        else:
+            items.append("J_市值_小")
 
-        # 价格相对20日均线位置 (Feature 2): 分为高于、接近、低于三档
-        price_vs_ma20 = raw_features[2]
-        if price_vs_ma20 > 1.05: items.append("价格_远高于20MA")
-        elif 0.95 <= price_vs_ma20 <= 1.05: items.append("价格_近20MA")
-        else: items.append("价格_远低于20MA")
-
-        # 收盘价在日内区间的位置 (Feature 6): 分为强势、弱势两档
-        close_pos_in_range = raw_features[6]
-        if close_pos_in_range > 0.7: items.append("收盘价_日内强势")
-        else: items.append("收盘价_日内弱势")
-
-        # 目标变量：高涨幅 (例如，涨幅 > 3%)
+        # 目标变量：高涨幅 (例如，涨幅 > 2%)
         change = safe_float(row.get('涨幅%'))
-        if pd.notna(change) and change > 3.0: # 可以调整这个阈值
+        if pd.notna(change) and change > 2.0: # 可以调整这个阈值
             items.append("高涨幅")
         else:
             items.append("低涨幅")
@@ -474,13 +501,16 @@ def perform_association_rule_mining(df):
 
     # 查找频繁项集
     # min_support 可以根据数据量调整，太小规则太多，太大规则太少
-    frequent_itemsets = apriori(df_ar, min_support=0.01, use_colnames=True) # 降低支持度以发现更多规则
+    frequent_itemsets = apriori(df_ar, min_support=0.01, use_colnames=True)
     if frequent_itemsets.empty:
         print("   ⚠️ 未找到频繁项集，请尝试降低 min_support。")
         return
 
     # 生成关联规则
-    rules = association_rules(frequent_itemsets, metric="lift", min_threshold=1.1) # 提高提升度阈值
+    # min_confidence 越高，规则越可靠
+    # lift > 1 表示前件和后件正相关
+    rules = association_rules(frequent_itemsets, metric="lift", min_threshold=1.1)
+
     if rules.empty:
         print("   ⚠️ 未找到有意义的关联规则，请尝试降低 min_threshold 或检查数据。")
         return
@@ -504,25 +534,23 @@ def perform_association_rule_mining(df):
 
     print("\n   关联规则挖掘完成。这些规则可以为策略优化提供洞察。")
 
-
 def main():
     """主程序"""
     print("\n" + "="*60)
-    print("动态选股系统 - 实时计算版 (集成XGBoost与关联规则)")
+    print("动态选股系统 - 实时计算版 (集成 XGBoost, TA-Lib 与关联规则)")
     print(f"运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("="*60)
 
     # 创建输出目录
     os.makedirs('输出数据', exist_ok=True)
-    os.makedirs('参考数据', exist_ok=True) # 确保参考数据目录存在
 
     # ========== 第一步：获取数据 ==========
     print("\n1. 获取A股数据...")
 
     df = pd.DataFrame()
-    # 尝试获取实时数据
+    # 先尝试获取实时数据
     try:
-        print("   尝试获取实时数据 (akshare.stock_zh_a_spot_em)...")
+        print("   尝试获取实时数据...")
         df_realtime = ak.stock_zh_a_spot_em()
         print(f"   ✅ 成功获取 {len(df_realtime)} 只股票的实时数据")
 
@@ -531,148 +559,199 @@ def main():
             '最新价': '最新',
             '涨跌幅': '涨幅%',
             '换手率': '实际换手%',
-            '市盈率-动态': '市盈率(动)',
-            '成交额': '成交额' # 确保成交额列名正确
+            '市盈率-动态': '市盈率(动)' # 确保列名一致
         }, inplace=True)
 
         # 保存原始代码
         df_realtime['原始代码'] = df_realtime['代码'].copy()
 
-        # 格式化代码以便Excel识别为文本
+        # 格式化代码
         df_realtime['代码'] = df_realtime['代码'].apply(lambda x: f'= "{str(x)}"')
 
-        # 确保所有关键列存在，并初始化为NaN
-        required_cols = ['代码', '名称', '最新', '涨幅%', '最高', '最低', '实际换手%', '成交额',
-                         '所属行业', '20日均价', '60日均价', '市盈率(动)','总市值', '归属净利润', '昨收', '开盘']
+        # 确保所有关键列存在，并初始化为None或默认值
+        required_cols = ['代码', '名称', '最新', '涨幅%', '最高', '最低', '实际换手%',
+                         '所属行业', '20日均价', '60日均价', '市盈率(动)', '总市值',
+                         '归属净利润', '昨收', '开盘', '原始代码']
         for col in required_cols:
             if col not in df_realtime.columns:
-                df_realtime[col] = np.nan
+                df_realtime[col] = np.nan # 使用NaN方便后续处理
 
-        df = df_realtime.copy()
+        df = df_realtime
 
     except Exception as e:
-        print(f"   ❌ 获取实时数据失败: {e}")
-        df = pd.DataFrame()
+        print(f"   ❌ 实时获取失败: {e}")
+        print("   使用参考数据作为备选...")
 
-    # 尝试从本地 Excel 文件补充数据
+        # 使用参考数据
+        try:
+            df_ref = pd.read_csv('参考数据/Table.xls', sep='\t', encoding='gbk', dtype=str)
+            print(f"   ✅ 从参考文件加载了 {len(df_ref)} 条数据")
+            df_ref['原始代码'] = df_ref['代码'].str.replace('= "', '').str.replace('"', '')
+            df = df_ref
+        except Exception as e2:
+            print(f"   ❌ 无法加载参考数据: {e2}")
+            return
+
+    # 尝试补充均线和财务数据 (如果实时数据缺失)
     try:
-        table_path = os.path.join('参考数据', 'Table.xls')
-        if os.path.exists(table_path):
-            print("   尝试从本地 Table.xls 补充数据...")
-            df_table = pd.read_csv(table_path, sep='\t', encoding='gbk') # 确保编码正确
-            # 统一代码格式
-            df_table['代码'] = df_table['代码'].astype(str).str.replace('="', '').str.replace('"', '')
+        ref_df_path = '参考数据/Table.xls'
+        if os.path.exists(ref_df_path):
+            ref_df = pd.read_csv(ref_df_path, sep='\t', encoding='gbk', dtype=str)
+            ref_map = {}
+            for _, row in ref_df.iterrows():
+                code = str(row['代码']).replace('= "', '').replace('"', '')
+                ref_map[code] = row.to_dict()
 
-            # 将df_table中的'代码'列设置为字符串类型
-            df_table['代码'] = df_table['代码'].astype(str)
-
-            # 将df中的'代码'列设置为字符串类型
-            df['代码'] = df['代码'].astype(str).str.replace('="', '').str.replace('"', '')
-
-            # 确保df_table中的列存在于df中
-            for col in ['20日均价', '60日均价', '市盈率(动)', '总市值', '归属净利润']:
-                if col not in df_table.columns:
-                    df_table[col] = np.nan
-
-            # 补充缺失数据
-            merged_df = pd.merge(df, df_table[['代码', '20日均价', '60日均价', '市盈率(动)', '总市值', '归属净利润']],
-                                  on='代码', how='left', suffixes=('', '_table'))
-
-            for col in ['20日均价', '60日均价', '市盈率(动)', '总市值', '归属净利润']:
-                df[col] = merged_df[col + '_table'].fillna(merged_df[col])
-
-            print(f"   ✅ 补充了 {len(df)} 条参考数据中的缺失信息 (如果Table.xls存在且有匹配数据)")
+            # 合并参考数据
+            merged_count = 0
+            for i, row in df.iterrows():
+                code = row.get('原始代码')
+                if code and code in ref_map:
+                    ref = ref_map[code]
+                    # 补充缺失的数据
+                    for col in ['20日均价', '60日均价', '所属行业', '归属净利润', '总市值', '市盈率(动)']:
+                        if col in ref and pd.isna(df.loc[i, col]): # 只补充NaN的值
+                            df.loc[i, col] = ref[col]
+                    merged_count += 1
+            print(f"   ✅ 补充了 {merged_count} 条参考数据")
         else:
-            print("   ⚠️ 未找到 Table.xls，跳过数据补充")
+            print("   ⚠️ 未找到参考数据文件 '参考数据/Table.xls'，无法补充数据。")
     except Exception as e:
-        print(f"   ❌ 从 Table.xls 补充数据失败: {e}")
+        print(f"   ⚠️ 补充参考数据时发生错误: {e}")
 
-    # 保存A股数据到CSV
-    csv_path = os.path.join('输出数据', 'A股数据.csv')
-    df.to_csv(csv_path, encoding='utf_8_sig', index=True, header=True)
-    print(f"\n✅ A股数据已保存: {csv_path}")
-    print(f"   共 {len(df)} 只股票")
+    # 统一数据格式
+    for col in ['最新', '最高', '最低', '开盘', '昨收', '涨幅%', '实际换手%', '20日均价', '60日均价', '市盈率(动)', '总市值', '归属净利润']:
+        df[col] = df[col].apply(safe_float)
+
+    # 添加序号
+    df['序'] = range(1, len(df) + 1)
+    df['Unnamed: 16'] = '' # 保持与原文件格式一致
+
+    # 选择输出列
+    output_columns = [
+        '序', '代码', '名称', '最新', '涨幅%', '最高', '最低',
+        '实际换手%', '所属行业', '20日均价', '60日均价',
+        '市盈率(动)', '总市值', '归属净利润', '昨收', '开盘', 'Unnamed: 16'
+    ]
+
+    # 确保所有输出列都存在，并填充默认值
+    for col in output_columns:
+        if col not in df.columns:
+            df[col] = np.nan if col not in ['代码', '名称', 'Unnamed: 16'] else ' --'
+
+    # 格式化输出到CSV的数值列
+    for col in ['最新', '涨幅%', '最高', '最低', '实际换手%', '20日均价', '60日均价', '市盈率(动)', '总市值', '归属净利润', '昨收', '开盘']:
+        df[col] = df[col].apply(lambda x: f" {x:.2f}" if pd.notna(x) else " --")
+
+    # 格式化代码和名称
+    df['代码'] = df['代码'].apply(lambda x: f'= "{str(x)}"' if not str(x).startswith('=') else x)
+    df['名称'] = df['名称'].apply(lambda x: f" {x}" if not str(x).startswith(' ') else x)
+
+    final_df_for_output = df[output_columns].copy()
+
+    # 保存A股数据
+    output_file1 = '输出数据/A股数据.csv'
+    final_df_for_output.to_csv(output_file1, index=False, encoding='utf-8-sig')
+    print(f"\n✅ A股数据已保存: {output_file1}")
+    print(f"   共 {len(final_df_for_output)} 只股票")
 
     # ========== 第二步：训练 XGBoost 模型 ==========
-    model, scaler, feature_names = train_xgboost_model(df.copy()) # 传递 df 的副本
+    print("\n2. 训练 XGBoost 模型...")
+    model, scaler, technical_indicators = train_xgboost_model(df.copy()) # 传入原始数值的df副本
 
-    if model is None or scaler is None:
-        print("   ❌ 模型训练失败，无法进行后续预测。")
+    if model is None:
+        print("   ❌ XGBoost 模型训练失败，无法进行后续筛选。")
         return
 
-    # 显示模型特征重要性
-    if hasattr(model, 'feature_importances_'):
-        importances = model.feature_importances_
-        feature_importance = pd.DataFrame({'Feature': feature_names, 'Importance': importances})
-        feature_importance = feature_importance.sort_values(by='Importance', ascending=False)
-        print("\n   模型特征重要性 (Feature Importance):")
-        print(feature_importance.to_string(index=False))
+    # ========== 第三步：动态筛选优质股票 ==========
+    print("\n3. 动态筛选优质股票 (基于 XGBoost 评分)...")
+
+    quality_stocks = []
+
+    # 重新加载原始数值的df，因为上面为了输出csv已经格式化了
+    df_for_scoring = df.copy()
+    for col in ['最新', '涨幅%', '最高', '最低', '实际换手%', '20日均价', '60日均价', '市盈率(动)', '总市值', '归属净利润', '昨收', '开盘']:
+        df_for_scoring[col] = df_for_scoring[col].apply(safe_float)
+        
+    df_for_scoring['原始代码'] = df_for_scoring['代码'].apply(lambda x: str(x).replace('= "', '').replace('"', ''))
+
+    for idx, row in df_for_scoring.iterrows():
+        score = predict_score_with_xgboost(row, model, scaler, technical_indicators, df_for_scoring)
+
+        if pd.notna(score):  # 确保分数有效
+            code = str(row['原始代码']).strip()
+            quality_stocks.append({
+                '代码': code,
+                '名称': str(row['名称']).strip(),
+                '行业': str(row['所属行业']).strip(),
+                '优质率': score,
+                '涨幅': f"{safe_float(row['涨幅%']):.2f}%" if pd.notna(safe_float(row['涨幅%'])) else "--"
+            })
+
+    # 按优质率降序排序
+    quality_stocks = sorted(quality_stocks, key=lambda x: (x['优质率'], x['代码']), reverse=True)
+
+    # 确定筛选阈值：取前N个，或者根据分数分布动态调整
+    display_count = 15  # 默认显示前15个
+    if len(quality_stocks) > display_count:
+        # 如果股票数量足够，取前N个的最低分数作为阈值
+        threshold = quality_stocks[display_count - 1]['优质率']
+        quality_stocks_filtered = quality_stocks[:display_count]
+    elif len(quality_stocks) > 0:
+        threshold = quality_stocks[-1]['优质率']  # 所有股票的最低分
+        quality_stocks_filtered = quality_stocks
     else:
-        print("\n   ⚠️ 模型不支持特征重要性评估。")
+        threshold = 0.0
+        quality_stocks_filtered = []
 
-    # ========== 第三步：动态筛选优质股票并生成策略信号 ==========
-    print("\n3. 动态筛选优质股票并生成策略信号 (基于XGBoost评分)...")
-
-    # 使用模型预测评分
-    df['predicted_score'] = df.apply(lambda row: predict_score_with_model(row, model, scaler), axis=1)
-
-    # 移除 predicted_score 为 NaN 的行
-    df = df.dropna(subset=['predicted_score']).copy()
-
-    # 根据 predicted_score 排序
-    df = df.sort_values(by='predicted_score', ascending=False)
-
-    # 确定最低优质率阈值 (基于前20名或全部)
-    num_to_consider = min(20, len(df))
-    min_quality_threshold = df['predicted_score'].iloc[num_to_consider - 1] if num_to_consider > 0 else 0
-
-    # 筛选符合条件的股票
-    qualified_stocks = df[df['predicted_score'] >= min_quality_threshold].copy()
-
-    # 生成策略信号
-    qualified_stocks['strategy_signal'] = qualified_stocks.apply(lambda row: generate_strategy_signals(row, row['predicted_score']), axis=1)
-
-    # 保存优质股票及策略信号到文本文件
-    output_path = os.path.join('输出数据', '优质股票_策略信号.txt')
-    with open(output_path, 'w', encoding='utf-8') as f:
-        f.write("苏氏量化策略 - 优质股票筛选结果与策略信号 (XGBoost评分)\n")
+    # 保存优质股票
+    output_file2 = '输出数据/优质股票.txt'
+    with open(output_file2, 'w', encoding='utf-8') as f:
+        f.write("苏氏量化策略 - 优质股票筛选结果 (XGBoost 评分)\n")
         f.write(f"筛选时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"最低优质率阈值 (基于前20名或全部): {min_quality_threshold:.4f}\n")
+        f.write(f"最低优质率阈值 (基于前{display_count}名或全部): {threshold:.4f}\n")
+        f.write(f"优质股票数量: {len(quality_stocks_filtered)}\n")
+        f.write("=" * 50 + "\n\n")
 
-        buy_signals = qualified_stocks[qualified_stocks['strategy_signal'].str.contains('买入')].copy()
-        num_buy_signals = len(buy_signals)
-        f.write(f"符合买入信号的优质股票数量: {num_buy_signals}\n")
-
-        f.write("=" * 60 + "\n")
-        for index, row in buy_signals.iterrows():
-            f.write(f"股票代码: {row['代码']}\n")
-            f.write(f"股票名称: {row['名称']}\n")
-            f.write(f"所属行业: {row['所属行业']}\n")
-            f.write(f"优质率 (XGBoost评分): {row['predicted_score']:.4f}\n")
-            f.write(f"今日涨幅: {row['涨幅%']}\n")
-            f.write(f"策略信号: {row['strategy_signal']}\n")
+        for stock in quality_stocks_filtered:
+            f.write(f"股票代码: {stock['代码']}\n")
+            f.write(f"股票名称: {stock['名称']}\n")
+            f.write(f"所属行业: {stock['行业']}\n")
+            f.write(f"优质率 (XGBoost 评分): {stock['优质率']:.4f}\n")
+            f.write(f"今日涨幅: {stock['涨幅']}\n")
             f.write("-" * 30 + "\n")
 
-    print(f"\n✅ 优质股票及策略信号已保存: {output_path}")
-    print(f"   找到 {num_buy_signals} 只符合买入条件的优质股票（最低优质率={min_quality_threshold:.4f}）")
+    print(f"\n✅ 优质股票已保存: {output_file2}")
+    print(f"   找到 {len(quality_stocks_filtered)} 只优质股票（最低优质率={threshold:.4f}）")
 
-    # 输出今日优质股票列表 (带买入信号的前 N 名)
-    N = min(4, num_buy_signals)
-    print(f"\n🎯 今日优质股票列表 (前{N}名，仅显示买入信号)：")
-    print("=" * 85)
-    print(f"{'股票代码':<10} {'股票名称':<15} {'涨幅':<8} {'优质率':<8} {'所属行业':<15} {'策略信号':<40}")
-    print("-" * 85)
-    for index, row in buy_signals.head(N).iterrows():
-        print(f"{row['代码']:<10} {row['名称']:<15} {str(row['涨幅%']):<8} {row['predicted_score']:.4f:<8} {row['所属行业']:<15} {row['strategy_signal']:<40}")
-    print("=" * 85)
+    # 生成交易策略
+    print("\n   生成交易策略建议...")
+    trading_strategies = []
+    for stock in quality_stocks_filtered:
+        strategy = generate_trading_strategy(stock, df_for_scoring, model, scaler, technical_indicators)
+        trading_strategies.append(strategy)
 
-    # ========== 第四步：执行关联规则挖掘 ==========
-    perform_association_rule_mining(df.copy()) # 传递 df 的副本
+    if len(quality_stocks_filtered) > 0:
+        print(f"\n🎯 今日优质股票列表及交易策略建议 (前{len(quality_stocks_filtered)}名)：")
+        print("=" * 100)
+        print(f"{'股票代码':<10} {'股票名称':<12} {'涨幅':<8} {'优质率':<10} {'所属行业':<15} {'建议':<10} {'周期':<8} {'仓位':<8} {'理由':<30}")
+        print("-" * 100)
+        for strategy in trading_strategies:
+            print(f"{strategy['代码']:<10} {strategy['名称']:<12} {df_for_scoring[df_for_scoring['原始代码'] == strategy['代码']]['涨幅%'].values[0]:<8} {df_for_scoring[df_for_scoring['原始代码'] == strategy['代码']]['quality_score'].values[0]:.4f}   {df_for_scoring[df_for_scoring['原始代码'] == strategy['代码']]['所属行业'].values[0]:<15} {strategy['建议']:<10} {strategy['周期']:<8} {strategy['仓位']:<8} {', '.join(strategy['理由']):<30}")
+    else:
+        print("\n⚠️ 今日没有找到符合条件的优质股票")
+        print("   可能原因：")
+        print("   1. 市场整体表现不佳，涨幅不足")
+        print("   2. 数据获取不完整或质量不佳")
+        print("   3. XGBoost 模型需要更多数据或优化")
 
-    print("\n" + "="*60)
+    # ========== 第四步：关联规则挖掘 ==========
+    # 在这里调用关联规则挖掘函数
+    perform_association_rule_mining(df_for_scoring.copy())  # 传入原始数值的df副本
+
+    print("\n" + "=" * 60)
     print("✅ 程序执行完成！")
-    print("="*60 + "\n")
+    print("=" * 60)
 
 if __name__ == "__main__":
     main()
-
