@@ -76,7 +76,7 @@ def calculate_features(row):
 
     # G列：涨幅和价格位置 (0或1)
     try:
-        change = safe_float(row.get('涨幅%'))
+        change = safe_float(row.get('涨跌幅')) # 使用涨跌幅代替涨幅%
         current = safe_float(row.get('最新'))
         high = safe_float(row.get('最高'))
         low = safe_float(row.get('最低'))
@@ -93,16 +93,12 @@ def calculate_features(row):
     except:
         features.append(0) # 默认值
 
-    # H列：归属净利润 (数值，单位亿)
-    try:
-        profit = safe_float(row.get('归属净利润'))
-        features.append(profit if pd.notna(profit) else 0)
-    except:
-        features.append(0)
+    # H列：归属净利润 (数值，单位亿) -  无法获取，用0代替
+    features.append(0)
 
     # I列：实际换手率 (数值)
     try:
-        turnover = safe_float(row.get('实际换手%'))
+        turnover = safe_float(row.get('换手率')) # 使用换手率代替实际换手%
         features.append(turnover if pd.notna(turnover) else 100) # 缺失时给一个较大值
     except:
         features.append(100)
@@ -126,18 +122,9 @@ def calculate_technical_indicators(df_row):
         close_price = safe_float(df_row.get('最新'))
         high_price = safe_float(df_row.get('最高'))
         low_price = safe_float(df_row.get('最低'))
-        ma_5 = safe_float(df_row.get('5日均价'))
-        ma_20 = safe_float(df_row.get('20日均价'))
-        ma_60 = safe_float(df_row.get('60日均价'))
-        volume = safe_float(df_row.get('成交量'))
 
-        # 简单移动平均线交叉信号 (1:金叉, -1:死叉, 0:无)
+        # 简单移动平均线交叉信号 (1:金叉, -1:死叉, 0:无) - 无法计算，给一个中性值
         sma_signal = 0
-        if pd.notna(ma_5) and pd.notna(ma_20):
-             if ma_5 > ma_20:
-                 sma_signal = 1
-             elif ma_5 < ma_20:
-                 sma_signal = -1
 
         # 相对强弱指标 (RSI) - 简化计算
         rsi = 50 # 无法计算，给一个中性值
@@ -207,9 +194,9 @@ def train_neural_network(df, target_type='comprehensive'):
     X = np.array(X)
 
     # 提取用于计算质量评分的列
-    change = df['涨幅%'].apply(safe_float)
-    profit = df['归属净利润'].apply(safe_float)
-    turnover = df['实际换手%'].apply(safe_float)
+    change = df['涨跌幅'].apply(safe_float) # 使用涨跌幅代替涨幅%
+    profit = pd.Series([0] * len(df)) # 无法获取，用0代替
+    turnover = df['换手率'].apply(safe_float) # 使用换手率代替实际换手%
     market_cap = df['总市值'].apply(safe_float)
     pe_ratio = df['市盈率(动)'].apply(safe_float)
 
@@ -331,11 +318,11 @@ def perform_association_rule_mining(df):
 
     # 特征工程：将数值特征转换为离散特征
     print("   特征离散化...")
-    df['涨幅%_类别'] = pd.cut(df['涨幅%'].apply(safe_float), bins=[-np.inf, -5, 0, 5, 10, np.inf],
+    df['涨跌幅_类别'] = pd.cut(df['涨跌幅'].apply(safe_float), bins=[-np.inf, -5, 0, 5, 10, np.inf],
                          labels=['极低', '低', '中', '高', '极高'])
-    df['归属净利润_类别'] = pd.cut(df['归属净利润'].apply(safe_float), bins=[-np.inf, -10, 0, 10, 50, np.inf],
-                             labels=['亏损', '微利', '一般', '良好', '优秀'])
-    df['实际换手%_类别'] = pd.cut(df['实际换手%'].apply(safe_float), bins=[-np.inf, 1, 3, 5, 10, np.inf],
+    df['归属净利润_类别'] = pd.cut(pd.Series([0] * len(df)), bins=[-np.inf, -10, 0, 10, 50, np.inf],
+                             labels=['亏损', '微利', '一般', '良好', '优秀']) # 无法获取，用0代替
+    df['换手率_类别'] = pd.cut(df['换手率'].apply(safe_float), bins=[-np.inf, 1, 3, 5, 10, np.inf],
                              labels=['极低', '低', '中', '高', '极高'])
     df['总市值_类别'] = pd.cut(df['总市值'].apply(safe_float), bins=[-np.inf, 100, 500, 1000, 5000, np.inf],
                            labels=['小型', '中型', '大型', '超大型', '巨型'])
@@ -353,7 +340,7 @@ def perform_association_rule_mining(df):
 
     # 选择用于关联规则挖掘的列
     print("   选择用于关联规则挖掘的列...")
-    selected_columns = ['行业', '地区', '涨幅%_类别', '归属净利润_类别', '实际换手%_类别', '总市值_类别',
+    selected_columns = ['行业', '地区', '涨跌幅_类别', '归属净利润_类别', '换手率_类别', '总市值_类别',
                           '价格位置_类别', '涨幅和价格位置_类别']
     df_selected = df[selected_columns].copy()
 
@@ -406,13 +393,13 @@ def main():
     print(f"   剔除ST股后剩余 {len(stock_list_df)} 只股票")
 
     # ========== 第二步：获取股票详细数据并进行预处理 ==========
-    print("\n   开始获取股票详细数据并进行预处理...")
+    print("\n   开始获取股票实时数据并进行预处理...")
     df_list = []
     error_codes = []
     for i, row in stock_list_df.iterrows():
         code = row['代码']
         name = row['名称']
-        print(f"   [{i+1}/{len(stock_list_df)}] 获取 {name}({code}) 详细数据...", end="")
+        print(f"   [{i+1}/{len(stock_list_df)}] 获取 {name}({code}) 实时数据...", end="")
         try:
             # 获取股票实时数据
             stock_realtime_df = ak.stock_zh_a_spot(symbol=code)
@@ -448,7 +435,7 @@ def main():
     # 数据清洗和转换
     print("\n   数据清洗和转换...")
     df['涨幅'] = df['涨跌幅'].apply(safe_float)
-    df['涨幅%'] = df['涨跌幅'].apply(safe_float)
+    df['涨跌幅'] = df['涨跌幅'].apply(safe_float) # 修正列名
     df['总市值'] = df['总市值'].apply(safe_float)
     df['流通市值'] = df['流通市值'].apply(safe_float)
     df['换手率'] = df['换手率'].apply(safe_float)
@@ -458,15 +445,10 @@ def main():
     df['最低'] = df['最低'].apply(safe_float)
     df['最新'] = df['最新'].apply(safe_float)
     df['成交量'] = df['成交量'].apply(safe_float)
-    df['实际换手%'] = df['换手率'].apply(safe_float)
-    df['归属净利润'] = df['归属净利润'].apply(safe_float)
-    df['5日均价'] = df['5日均价'].apply(safe_float)
-    df['20日均价'] = df['20日均价'].apply(safe_float)
-    df['60日均价'] = df['60日均价'].apply(safe_float)
 
     # 移除包含 NaN 或无穷大的行
     df_for_scoring = df.copy() # 用于评分
-    df = df.dropna(subset=['涨幅%', '总市值', '换手率', '市盈率(动)'])
+    df = df.dropna(subset=['涨跌幅', '总市值', '换手率', '市盈率(动)']) # 使用涨跌幅代替涨幅%
     df = df[~df.isin([np.nan, np.inf, -np.inf]).any(axis=1)]
 
     print(f"   清洗后剩余 {len(df)} 只股票")
@@ -556,7 +538,7 @@ def main():
         print(f"{'股票代码':<10} {'股票名称':<12} {'涨幅%':<8} {'综合评分':<10} {'短期评分':<10} {'长期评分':<10} {'总市值(亿)':<12} {'换手率(%)':<10} {'市盈率(动)':<12} {'所属行业':<15}")
         print("-"*130)
         for stock in quality_stocks_filtered.to_dict('records'):
-            print(f"{stock['代码']:<10} {stock['名称']:<12} {stock['涨幅%']:<8.2f} {stock['综合评分']:<10.4f} {stock['短期评分']:<10.4f} {stock['长期评分']:<10.4f} {stock['总市值']:<12.2f} {stock['换手率']:<10.2f} {stock['市盈率(动)']:<12.2f} {stock['行业']:<15}")
+            print(f"{stock['代码']:<10} {stock['名称']:<12} {stock['涨幅']:<8.2f} {stock['综合评分']:<10.4f} {stock['短期评分']:<10.4f} {stock['长期评分']:<10.4f} {stock['总市值']:<12.2f} {stock['换手率']:<10.2f} {stock['市盈率(动)':<12.2f} {stock['行业']:<15}")
 
         # ========== 第五步：结合分析给出投资建议 ==========
         print("\n   投资建议 (基于模型评分、技术指标和基本面):")
@@ -566,7 +548,7 @@ def main():
             comprehensive_score = stock['综合评分']
             short_term_score = stock['短期评分']
             long_term_score = stock['长期评分']
-            change_percent = stock['涨幅%']
+            change_percent = stock['涨幅']
             market_cap = stock['总市值']
             turnover_rate = stock['换手率']
             pe_ratio = stock['市盈率(动)']
