@@ -1,17 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-动态选股系统 - 实时计算版 (集成神经网络、关联规则与 XGBoost)
-基于苏氏量化策略的真实计算逻辑
-集成神经网络进行初步评分，XGBoost进行精准预测
-新增：
-1. 使用 Optuna 进行神经网络超参数优化，提升评分精度和区分度。
-2. 引入关联规则挖掘，分析哪些条件组合更容易产生高收益，提供策略洞察。
-3. 优化数据处理和输出展示。
-4. 优化代码准确性、质量和效率。
-5. 使用复合质量评分作为神经网络的目标变量，提高模型准确性。
-6. 集成XGBoost模型，替代神经网络，进行更精准的预测。
-7. 提供基于特征和预测结果的短期/长期买入/卖出策略建议。
+动态选股系统 - 实时计算版 (集成神经网络与关联规则)
+结合专门技术优化预测模型 结合特征和预测结果给我策略 针对推荐股票 短期/长期 买入/卖出 结合专业分析进行补充 完整代码
 """
 
 import akshare as ak
@@ -22,7 +13,8 @@ import os
 import warnings
 warnings.filterwarnings('ignore')
 
-# 导入机器学习相关库
+# 导入神经网络相关库
+from sklearn.neural_network import MLPRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, r2_score
@@ -33,9 +25,6 @@ import optuna
 # 导入 mlxtend 进行关联规则挖掘
 from mlxtend.frequent_patterns import apriori, association_rules
 from mlxtend.preprocessing import TransactionEncoder
-
-# 导入 XGBoost
-import xgboost as xgb
 
 # 清除代理设置
 os.environ['HTTP_PROXY'] = ''
@@ -64,7 +53,7 @@ def safe_float(value_str):
 
 def calculate_features(row):
     """
-    根据苏氏量化策略计算特征值，用于机器学习训练和关联规则挖掘。
+    根据苏氏量化策略计算特征值，用于神经网络训练和关联规则挖掘。
     返回一个包含数值特征的列表。
     """
     features = []
@@ -125,40 +114,54 @@ def calculate_features(row):
     except:
         features.append(0)
 
-    # K列：市盈率 (动)
-    try:
-        pe = safe_float(row.get('市盈率(动)'))
-        features.append(pe if pd.notna(pe) else 100)  # 缺失时给一个较大值
-    except:
-        features.append(100)
-
-    # L列：20日均价与60日均价的差值
-    try:
-        ma20 = safe_float(row.get('20日均价'))
-        ma60 = safe_float(row.get('60日均价'))
-        ma_diff = ma20 - ma60
-        features.append(ma_diff if pd.notna(ma20) and pd.notna(ma60) else 0)
-    except:
-        features.append(0)
-
-    # M列：昨日收盘价
-    try:
-        last_close = safe_float(row.get('昨收'))
-        features.append(last_close if pd.notna(last_close) else 0)
-    except:
-        features.append(0)
-
-    # N列：今日开盘价
-    try:
-        open_price = safe_float(row.get('开盘'))
-        features.append(open_price if pd.notna(open_price) else 0)
-    except:
-        features.append(0)
-
     return features
 
-def calculate_quality_score(df):
-    """计算复合质量评分"""
+def objective(trial, X_train, y_train, X_test, y_test):
+    """
+    Optuna 优化目标函数
+    """
+    hidden_layer_sizes = []
+    n_layers = trial.suggest_int('n_layers', 1, 3)
+    for i in range(n_layers):
+        hidden_layer_sizes.append(trial.suggest_int(f'n_units_l{i}', 16, 128))
+
+    activation = trial.suggest_categorical('activation', ['relu', 'tanh', 'logistic'])
+    solver = trial.suggest_categorical('solver', ['adam', 'sgd'])
+    alpha = trial.suggest_loguniform('alpha', 1e-5, 1e-1)
+    learning_rate_init = trial.suggest_loguniform('learning_rate_init', 1e-4, 1e-2)
+
+    model = MLPRegressor(
+        hidden_layer_sizes=tuple(hidden_layer_sizes),
+        activation=activation,
+        solver=solver,
+        alpha=alpha,
+        learning_rate_init=learning_rate_init,
+        random_state=42,
+        max_iter=500,
+        early_stopping=True,
+        n_iter_no_change=20, # 增加耐心
+        tol=1e-4 # 增加容忍度
+    )
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+    mse = mean_squared_error(y_test, y_pred)
+    return mse # Optuna 默认最小化目标
+
+def train_neural_network(df):
+    """
+    训练神经网络模型，预测股票评分，使用 Optuna 进行超参数优化。
+    使用复合质量评分作为目标变量。
+    """
+    print("\n   准备训练数据...")
+    X = []
+    # y = []  # 目标变量：涨幅作为评分的依据
+
+    for _, row in df.iterrows():
+        features = calculate_features(row)
+        X.append(features)
+
+    X = np.array(X)
+
     # 提取用于计算质量评分的列
     change = df['涨幅%'].apply(safe_float)
     profit = df['归属净利润'].apply(safe_float)
@@ -181,7 +184,7 @@ def calculate_quality_score(df):
     pe_ratio_norm = pe_ratio_norm.fillna(0)
 
     # 计算复合质量评分 (可以调整权重)
-    quality_score = (
+    df['quality_score'] = (
         0.3 * change_norm +  # 涨幅
         0.25 * profit_norm +  # 净利润
         0.15 * (1 - abs(turnover_norm - 0.5)) +  # 换手率 (适中最好)
@@ -189,55 +192,15 @@ def calculate_quality_score(df):
         0.1 * (1 - pe_ratio_norm)  # 市盈率 (越低越好)
     )
 
-    return quality_score
-
-def objective_xgboost(trial, X_train, y_train, X_test, y_test):
-    """Optuna 优化 XGBoost 目标函数"""
-    params = {
-        'objective': 'reg:squarederror',
-        'eval_metric': 'rmse',
-        'booster': trial.suggest_categorical('booster', ['gbtree', 'gblinear', 'dart']),
-        'lambda': trial.suggest_loguniform('lambda', 1e-8, 1.0),
-        'alpha': trial.suggest_loguniform('alpha', 1e-8, 1.0),
-    }
-
-    if params['booster'] == 'gbtree' or params['booster'] == 'dart':
-        params['max_depth'] = trial.suggest_int('max_depth', 3, 9)
-        params['eta'] = trial.suggest_loguniform('eta', 0.01, 0.3)
-        params['gamma'] = trial.suggest_loguniform('gamma', 1e-8, 1.0)
-        params['grow_policy'] = trial.suggest_categorical('grow_policy', ['depthwise', 'lossguide'])
-
-    if params['booster'] == 'dart':
-        params['sample_type'] = trial.suggest_categorical('sample_type', ['uniform', 'weighted'])
-        params['normalize_type'] = trial.suggest_categorical('normalize_type', ['tree', 'forest'])
-        params['rate_drop'] = trial.suggest_loguniform('rate_drop', 1e-8, 1.0)
-        params['skip_drop'] = trial.suggest_loguniform('skip_drop', 1e-8, 1.0)
-
-    model = xgb.XGBRegressor(**params, random_state=42)
-    model.fit(X_train, y_train, eval_set=[(X_test, y_test)], early_stopping_rounds=50, verbose=False)
-    predictions = model.predict(X_test)
-    rmse = np.sqrt(mean_squared_error(y_test, predictions))
-    return rmse
-
-def train_xgboost_model(df):
-    """训练 XGBoost 模型"""
-    print("\n   准备训练数据...")
-    X = []
-    for _, row in df.iterrows():
-        features = calculate_features(row)
-        X.append(features)
-    X = np.array(X)
-
-    # 计算质量评分
-    y = calculate_quality_score(df).values
+    y = df['quality_score'].values
 
     # 移除包含 NaN 或无穷大的行
     mask = ~np.any(np.isnan(X) | np.isinf(X), axis=1) & ~np.isnan(y) & ~np.isinf(y)
     X = X[mask]
     y = y[mask]
 
-    if len(X) < 20:
-        print("   ❌ 有效训练数据不足，无法训练 XGBoost 模型。")
+    if len(X) < 20: # 至少需要一些数据来划分训练集和测试集
+        print("   ❌ 有效训练数据不足，无法训练神经网络。")
         return None, None
 
     print(f"   有效训练样本数: {len(X)}")
@@ -255,30 +218,45 @@ def train_xgboost_model(df):
     print("   启动 Optuna 超参数优化 (可能需要一些时间)...")
     study = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=42))
     try:
-        study.optimize(lambda trial: objective_xgboost(trial, X_train, y_train, X_test, y_test), n_trials=50, show_progress_bar=True)
+        study.optimize(lambda trial: objective(trial, X_train, y_train, X_test, y_test), n_trials=50, show_progress_bar=True)
     except Exception as e:
         print(f"   Optuna 优化过程中发生错误: {e}")
         print("   将使用默认或预设参数训练模型。")
+        # 如果Optuna失败，使用一个合理的默认配置
         best_params = {
-            'objective': 'reg:squarederror',
-            'eval_metric': 'rmse',
-            'booster': 'gbtree',
-            'max_depth': 5,
-            'eta': 0.1,
-            'gamma': 0.0,
-            'lambda': 1.0,
-            'alpha': 0.0,
+            'n_layers': 2,
+            'n_units_l0': 64,
+            'n_units_l1': 32,
+            'activation': 'relu',
+            'solver': 'adam',
+            'alpha': 0.0001,
+            'learning_rate_init': 0.001
         }
     else:
         print("\n   Optuna 优化完成。")
-        print(f"   最佳均方根误差 (RMSE): {study.best_value:.4f}")
+        print(f"   最佳均方误差 (MSE): {study.best_value:.4f}")
         print(f"   最佳超参数: {study.best_params}")
         best_params = study.best_params
 
     # 使用最佳参数训练最终模型
-    print("   使用最佳参数训练最终 XGBoost 模型...")
-    model = xgb.XGBRegressor(**best_params, random_state=42)
-    model.fit(X_train, y_train, eval_set=[(X_test, y_test)], early_stopping_rounds=100, verbose=False)
+    print("   使用最佳参数训练最终神经网络模型...")
+    hidden_layer_sizes = []
+    for i in range(best_params['n_layers']):
+        hidden_layer_sizes.append(best_params[f'n_units_l{i}'])
+
+    model = MLPRegressor(
+        hidden_layer_sizes=tuple(hidden_layer_sizes),
+        activation=best_params['activation'],
+        solver=best_params['solver'],
+        alpha=best_params['alpha'],
+        learning_rate_init=best_params['learning_rate_init'],
+        random_state=42,
+        max_iter=1000, # 增加最大迭代次数
+        early_stopping=True,
+        n_iter_no_change=30, # 增加耐心
+        tol=1e-4 # 增加容忍度
+    )
+    model.fit(X_train, y_train)
 
     # 评估模型
     print("   评估最终模型...")
@@ -290,19 +268,23 @@ def train_xgboost_model(df):
 
     return model, scaler
 
-def predict_score_with_xgboost(row, model, scaler):
-    """使用训练好的 XGBoost 模型预测股票评分"""
+def predict_score_with_nn(row, model, scaler):
+    """
+    使用训练好的神经网络模型预测股票评分
+    """
     features = calculate_features(row)
+    # 检查特征中是否有NaN或Inf，如果有，则返回一个默认值或NaN
     if any(pd.isna(f) or np.isinf(f) for f in features):
-        return np.nan
+        return np.nan # 或者一个非常低的默认分数
 
-    features = np.array(features).reshape(1, -1)
+    features = np.array(features).reshape(1, -1)  # 转换为二维数组
     try:
         features_scaled = scaler.transform(features)
         score = model.predict(features_scaled)[0]
         return score
     except Exception as e:
-        return np.nan
+        # print(f"预测分数时发生错误: {e}, 特征: {features}")
+        return np.nan # 预测失败时返回NaN
 
 def perform_association_rule_mining(df):
     """
@@ -398,72 +380,11 @@ def perform_association_rule_mining(df):
 
     print("\n   关联规则挖掘完成。这些规则可以为策略优化提供洞察。")
 
-def generate_trading_strategy(row, score, rules):
-    """
-    根据股票特征、XGBoost预测评分和关联规则生成交易策略。
-    """
-    strategy = {}
-
-    # 1. 基本信息
-    code = row.get('原始代码', '未知')
-    name = row.get('名称', '未知')
-    current_price = safe_float(row.get('最新', 0))
-    change_percent = safe_float(row.get('涨幅%', 0))
-
-    strategy['代码'] = code
-    strategy['名称'] = name
-
-    # 2. XGBoost 评分解读
-    strategy['XGBoost评分'] = score
-    if score > 0.7:
-        strategy['评分解读'] = "高潜力股票，值得关注。"
-    elif score > 0.5:
-        strategy['评分解读'] = "中等潜力股票，可以考虑。"
-    else:
-        strategy['评分解读'] = "潜力较低，谨慎。"
-
-    # 3. 技术指标分析 (简化示例)
-    ma20 = safe_float(row.get('20日均价', 0))
-    ma60 = safe_float(row.get('60日均价', 0))
-
-    if current_price > ma20 and current_price > ma60:
-        strategy['技术面'] = "短期和长期趋势向上。"
-    elif current_price < ma20 and current_price < ma60:
-        strategy['技术面'] = "短期和长期趋势向下。"
-    else:
-        strategy['技术面'] = "趋势不明朗。"
-
-    # 4. 关联规则应用
-    applicable_rules = []
-    features = calculate_features(row)
-
-    # 简化的规则匹配，需要根据实际规则进行调整
-    if features[0] == 1 and features[1] == 1:
-        applicable_rules.append("价格位置和涨幅位置均满足")
-        strategy['关联规则'] = "价格位置和涨幅位置均满足，可能预示着进一步上涨。"
-    elif features[2] > 0.3 and features[3] <= 20:
-        applicable_rules.append("净利润高且换手率低")
-        strategy['关联规则'] = "净利润高且换手率低，可能代表着稳健增长。"
-    else:
-        strategy['关联规则'] = "未发现匹配的关联规则。"
-
-    # 5. 交易策略建议
-    if score > 0.7 and current_price > ma20:
-        strategy['短期策略'] = "逢低买入，短期目标涨幅5%-10%。"
-    elif score > 0.5 and features[2] > 0.3:
-        strategy['长期策略'] = "长期持有，关注公司基本面变化。"
-    else:
-        strategy['交易策略'] = "观望，等待更明确的信号。"
-
-    # 6. 风险提示
-    strategy['风险提示'] = "股市有风险，投资需谨慎。请结合自身风险承受能力进行决策。"
-
-    return strategy
 
 def main():
     """主程序"""
     print("\n" + "="*60)
-    print("动态选股系统 - 实时计算版 (集成 XGBoost 与关联规则)")
+    print("动态选股系统 - 实时计算版 (集成神经网络与关联规则)")
     print(f"运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("="*60)
 
@@ -581,19 +502,19 @@ def main():
     print(f"\n✅ A股数据已保存: {output_file1}")
     print(f"   共 {len(final_df_for_output)} 只股票")
 
-    # ========== 第二步：训练 XGBoost 模型 ==========
-    print("\n2. 训练 XGBoost 模型...")
-    model, scaler = train_xgboost_model(df.copy()) # 传入原始数值的df副本
+    # ========== 第二步：训练神经网络 ==========
+    print("\n2. 训练神经网络模型...")
+    model, scaler = train_neural_network(df.copy()) # 传入原始数值的df副本
 
     if model is None:
-        print("   ❌ XGBoost 模型训练失败，无法进行后续筛选。")
+        print("   ❌ 神经网络训练失败，无法进行后续筛选。")
         return
 
     # ========== 第三步：动态筛选优质股票 ==========
-    print("\n3. 动态筛选优质股票 (基于 XGBoost 评分)...")
+    print("\n3. 动态筛选优质股票 (基于神经网络评分)...")
 
     quality_stocks = []
-    
+
     # 重新加载原始数值的df，因为上面为了输出csv已经格式化了
     df_for_scoring = df.copy()
     for col in ['最新', '涨幅%', '最高', '最低', '实际换手%', '20日均价', '60日均价', '市盈率(动)', '总市值', '归属净利润', '昨收', '开盘']:
@@ -602,8 +523,8 @@ def main():
 
 
     for idx, row in df_for_scoring.iterrows():
-        score = predict_score_with_xgboost(row, model, scaler)
-        
+        score = predict_score_with_nn(row, model, scaler)
+
         if pd.notna(score): # 确保分数有效
             code = str(row['原始代码']).strip()
             quality_stocks.append({
@@ -611,7 +532,10 @@ def main():
                 '名称': str(row['名称']).strip(),
                 '行业': str(row['所属行业']).strip(),
                 '优质率': score,
-                '涨幅': f"{safe_float(row['涨幅%']):.2f}%" if pd.notna(safe_float(row['涨幅%'])) else "--"
+                '涨幅': f"{safe_float(row['涨幅%']):.2f}%" if pd.notna(safe_float(row['涨幅%'])) else "--",
+                '总市值': safe_float(row['总市值']),
+                '换手率': safe_float(row['实际换手%']),
+                '市盈率(动)': safe_float(row['市盈率(动)'])
             })
 
     # 按优质率降序排序
@@ -633,7 +557,7 @@ def main():
     # 保存优质股票
     output_file2 = '输出数据/优质股票.txt'
     with open(output_file2, 'w', encoding='utf-8') as f:
-        f.write("苏氏量化策略 - 优质股票筛选结果 (XGBoost 评分)\n")
+        f.write("苏氏量化策略 - 优质股票筛选结果 (神经网络评分)\n")
         f.write(f"筛选时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"最低优质率阈值 (基于前{display_count}名或全部): {threshold:.4f}\n")
         f.write(f"优质股票数量: {len(quality_stocks_filtered)}\n")
@@ -643,8 +567,11 @@ def main():
             f.write(f"股票代码: {stock['代码']}\n")
             f.write(f"股票名称: {stock['名称']}\n")
             f.write(f"所属行业: {stock['行业']}\n")
-            f.write(f"优质率 (XGBoost评分): {stock['优质率']:.4f}\n")
+            f.write(f"优质率 (NN评分): {stock['优质率']:.4f}\n")
             f.write(f"今日涨幅: {stock['涨幅']}\n")
+            f.write(f"总市值: {stock['总市值']:.2f} 亿\n")
+            f.write(f"换手率: {stock['换手率']:.2f}%\n")
+            f.write(f"市盈率(动): {stock['市盈率(动)']:.2f}\n")
             f.write("-"*30 + "\n")
 
     print(f"\n✅ 优质股票已保存: {output_file2}")
@@ -652,57 +579,75 @@ def main():
 
     if len(quality_stocks_filtered) > 0:
         print(f"\n🎯 今日优质股票列表 (前{len(quality_stocks_filtered)}名)：")
-        print("="*60)
-        print(f"{'股票代码':<10} {'股票名称':<12} {'涨幅':<8} {'优质率':<10} {'所属行业':<15}")
-        print("-"*60)
+        print("="*90)
+        print(f"{'股票代码':<10} {'股票名称':<12} {'涨幅':<8} {'优质率':<10} {'总市值(亿)':<12} {'换手率(%)':<10} {'市盈率(动)':<12} {'所属行业':<15}")
+        print("-"*90)
         for stock in quality_stocks_filtered:
-            print(f"{stock['代码']:<10} {stock['名称']:<12} {stock['涨幅']:<8} {stock['优质率']:.4f}   {stock['行业']:<15}")
+            print(f"{stock['代码']:<10} {stock['名称']:<12} {stock['涨幅']:<8} {stock['优质率']:.4f}   {stock['总市值']:.2f}   {stock['换手率']:.2f}   {stock['市盈率(动)']:.2f}   {stock['行业']:<15}")
+
+        # ========== 第五步：结合分析给出投资建议 ==========
+        print("\n   投资建议 (基于模型评分、关联规则和基本面):")
+        for stock in quality_stocks_filtered:
+            code = stock['代码']
+            name = stock['名称']
+            quality_score = stock['优质率']
+            change_percent = float(stock['涨幅'].replace('%', '')) if stock['涨幅'] != '--' else 0
+            market_cap = stock['总市值']
+            turnover_rate = stock['换手率']
+            pe_ratio = stock['市盈率(动)']
+            industry = stock['行业']
+
+            # 1. 基本面分析
+            # 这里可以加入更详细的基本面分析，例如 ROE、营收增长率等
+            # 但由于数据限制，这里只使用已有的数据
+            profitability = "良好" if pe_ratio > 0 and pe_ratio < 30 else "一般" # 市盈率
+            size = "大型" if market_cap > 1000 else "中小型" # 市值
+
+            # 2. 技术面分析 (简化)
+            # 这里可以加入均线、MACD 等技术指标的分析
+            momentum = "强" if change_percent > 2 else "弱"  # 涨幅
+
+            # 3. 关联规则分析 (简化)
+            # 这里可以根据关联规则的结果，判断哪些条件组合更有可能带来高涨幅
+            # 由于关联规则结果是动态的，这里只做一个示例
+            rule_signal = "积极" if quality_score > 0.7 and turnover_rate < 20 else "中性"
+
+            # 4. 综合判断和建议
+            print(f"\n   股票代码: {code} ({name})")
+            print(f"     综合评分: {quality_score:.4f}")
+            print(f"     所属行业: {industry}")
+            print(f"     基本面: {size}公司，盈利能力{profitability}")
+            print(f"     技术面: 今日动量{momentum}")
+            print(f"     关联规则信号: {rule_signal}")
+
+            # 投资建议
+            if quality_score > 0.8 and momentum == "强" and rule_signal == "积极":
+                if market_cap < 500:
+                    print("     建议: (短期)可考虑少量买入，关注后续走势。")
+                else:
+                    print("     建议: (长期)基本面良好，可作为长期投资标的。")
+            elif quality_score > 0.6 and momentum == "强":
+                print("     建议: (中期)可关注，但需谨慎，注意风险控制。")
+            else:
+                print("     建议: 暂不建议买入，继续观察。")
+
+            print("-" * 50)
+
     else:
         print("\n⚠️ 今日没有找到符合条件的优质股票")
         print("   可能原因：")
-        print("   1. 市场整体体表现不佳，涨幅不足")
+        print("   1. 市场整体表现不佳，涨幅不足")
         print("   2. 数据获取不完整或质量不佳")
-        print("   3. XGBoost 模型需要更多数据或优化")
+        print("   3. 神经网络模型需要更多数据或优化")
 
     # ========== 第四步：关联规则挖掘 ==========
     # 在这里调用关联规则挖掘函数
-    rules = perform_association_rule_mining(df_for_scoring.copy()) # 传入原始数值的df副本
-
-    # ========== 第五步：生成交易策略 ==========
-    print("\n5. 生成交易策略...")
-
-    trading_strategies = []
-    for idx, row in df_for_scoring.iterrows():
-        score = predict_score_with_xgboost(row, model, scaler)
-        if pd.notna(score):
-            strategy = generate_trading_strategy(row, score, rules)  # 传入关联规则结果
-            trading_strategies.append(strategy)
-
-    # 保存交易策略
-    output_file3 = '输出数据/交易策略.txt'
-    with open(output_file3, 'w', encoding='utf-8') as f:
-        f.write("苏氏量化策略 - 交易策略建议 (XGBoost 评分 & 关联规则)\n")
-        f.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write("="*50 + "\n\n")
-
-        for strategy in trading_strategies:
-            f.write(f"股票代码: {strategy.get('代码', '未知')}\n")
-            f.write(f"股票名称: {strategy.get('名称', '未知')}\n")
-            f.write(f"XGBoost 评分: {strategy.get('XGBoost评分', '未知'):.4f}\n")
-            f.write(f"评分解读: {strategy.get('评分解读', '无')}\n")
-            f.write(f"技术面: {strategy.get('技术面', '无')}\n")
-            f.write(f"关联规则: {strategy.get('关联规则', '无')}\n")
-            f.write(f"短期策略: {strategy.get('短期策略', '无')}\n")
-            f.write(f"长期策略: {strategy.get('长期策略', '无')}\n")
-            f.write(f"交易策略: {strategy.get('交易策略', '无')}\n")
-            f.write(f"风险提示: {strategy.get('风险提示', '无')}\n")
-            f.write("-"*30 + "\n")
-
-    print(f"\n✅ 交易策略已保存: {output_file3}")
+    perform_association_rule_mining(df_for_scoring.copy()) # 传入原始数值的df副本
 
     print("\n" + "="*60)
     print("✅ 程序执行完成！")
     print("="*60)
+
 
 if __name__ == "__main__":
     main()
