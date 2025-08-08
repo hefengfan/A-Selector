@@ -11,6 +11,8 @@
 4. 优化代码准确性、质量和效率。
 5. 使用复合质量评分作为神经网络的目标变量，提高模型准确性。
 6. **重大升级：引入更多技术指标，并定义短期/长期买卖策略。**
+7. **修复：akshare历史数据列数不匹配问题。**
+8. **关键修改：神经网络预测不再直接使用历史技术指标作为输入，但策略报告会结合。**
 """
 
 import akshare as ak
@@ -80,15 +82,31 @@ def get_stock_history_data(symbol, start_date, end_date):
         # 尝试从 akshare 获取数据
         df = ak.stock_zh_a_hist(symbol=symbol, period="daily", start_date=start_date, end_date=end_date, adjust="qfq")
         if df.empty:
-            print(f"   ⚠️ 未获取到 {symbol} 的历史数据。")
+            # print(f"   ⚠️ 未获取到 {symbol} 的历史数据。") # 减少打印，避免刷屏
             return pd.DataFrame()
-        df.columns = ['日期', '开盘', '收盘', '最高', '最低', '成交量', '成交额', '振幅', '涨跌幅', '涨跌额', '换手率']
+
+        # 定义我们期望的列名
+        expected_cols = ['日期', '开盘', '收盘', '最高', '最低', '成交量', '成交额', '振幅', '涨跌幅', '涨跌额', '换手率']
+
+        # 检查是否存在 'Unnamed: 0' 列，这是 akshare 常见的多余索引列
+        if 'Unnamed: 0' in df.columns:
+            df = df.drop(columns=['Unnamed: 0'])
+        
+        # 如果经过处理后，列数仍然不匹配，则打印错误并返回空DataFrame
+        if len(df.columns) != len(expected_cols):
+            # print(f"   ❌ {symbol} 历史数据列数不匹配。预期 {len(expected_cols)} 列，实际 {len(df.columns)} 列。") # 减少打印
+            # print(f"   实际列名: {df.columns.tolist()}")
+            return pd.DataFrame()
+
+        # 重新赋值列名
+        df.columns = expected_cols
+
         df['日期'] = df['日期'].dt.strftime('%Y%m%d')
         df = df.sort_values(by='日期').reset_index(drop=True)
         GLOBAL_HIST_DATA[symbol] = df.copy() # 缓存数据
         return df
     except Exception as e:
-        print(f"   ❌ 获取 {symbol} 历史数据失败: {e}")
+        # print(f"   ❌ 获取 {symbol} 历史数据失败: {e}") # 减少打印
         return pd.DataFrame()
 
 def calculate_technical_indicators(df_hist):
@@ -156,10 +174,10 @@ def calculate_technical_indicators(df_hist):
         'VOL_MA5': latest_data.get('VOL_MA5'), 'VOL_MA10': latest_data.get('VOL_MA10'), 'VOL_CHANGE': latest_data.get('VOL_CHANGE')
     }
 
-def calculate_all_features(row, hist_data_map):
+def calculate_nn_features(row):
     """
-    根据苏氏量化策略、基本面和技术指标计算特征值。
-    返回一个包含数值特征的列表。
+    计算神经网络的输入特征值。
+    这些特征不依赖于历史数据，只使用实时数据和苏氏量化策略。
     """
     features = []
 
@@ -199,7 +217,7 @@ def calculate_all_features(row, hist_data_map):
     except:
         features.append(0) # 默认值
 
-    # 2. 基本面特征 (H, I, J)
+    # 2. 基本面特征 (H, I, J, K)
     # H列：归属净利润 (数值，单位亿)
     try:
         profit = safe_float(row.get('归属净利润'))
@@ -227,27 +245,6 @@ def calculate_all_features(row, hist_data_map):
         features.append(pe if pd.notna(pe) else 0) # 缺失时给0
     except:
         features.append(0)
-
-    # 3. 技术指标特征 (从 hist_data_map 中获取)
-    symbol = row.get('原始代码')
-    tech_indicators = hist_data_map.get(symbol, {})
-
-    features.append(tech_indicators.get('MA5', np.nan))
-    features.append(tech_indicators.get('MA10', np.nan))
-    features.append(tech_indicators.get('MA20', np.nan))
-    features.append(tech_indicators.get('MA60', np.nan))
-    features.append(tech_indicators.get('MA120', np.nan))
-    features.append(tech_indicators.get('MA200', np.nan))
-    features.append(tech_indicators.get('RSI', np.nan))
-    features.append(tech_indicators.get('MACD_DIF', np.nan))
-    features.append(tech_indicators.get('MACD_DEA', np.nan))
-    features.append(tech_indicators.get('MACD_HIST', np.nan))
-    features.append(tech_indicators.get('BOLL_UP', np.nan))
-    features.append(tech_indicators.get('BOLL_MID', np.nan))
-    features.append(tech_indicators.get('BOLL_LOW', np.nan))
-    features.append(tech_indicators.get('VOL_MA5', np.nan))
-    features.append(tech_indicators.get('VOL_MA10', np.nan))
-    features.append(tech_indicators.get('VOL_CHANGE', np.nan))
 
     # 确保所有特征都是数值类型，并处理NaN
     final_features = [f if pd.notna(f) else 0 for f in features] # 将所有NaN填充为0
@@ -293,19 +290,12 @@ def train_neural_network(df):
     print("\n   准备训练数据...")
     X = []
     
-    # 获取所有股票的历史数据，用于计算技术指标
-    today_str = datetime.now().strftime('%Y%m%d')
-    # 需要足够长的历史数据来计算所有指标，例如200天均线
-    start_date_hist = (datetime.now() - timedelta(days=300)).strftime('%Y%m%d')
-    
-    hist_data_map = {}
-    for symbol in df['原始代码'].unique():
-        hist_data_map[symbol] = calculate_technical_indicators(
-            get_stock_history_data(symbol, start_date_hist, today_str)
-        )
+    # 注意：这里不再需要 hist_data_map 来计算 X 的特征，因为 X 只包含实时数据特征。
+    # 但如果你的目标变量 y 的计算依赖于历史数据（例如，未来涨幅），那么你仍然需要历史数据来构建 y。
+    # 当前的 quality_score 目标变量只依赖于实时基本面数据，所以这里不需要额外的历史数据获取。
 
     for _, row in df.iterrows():
-        features = calculate_all_features(row, hist_data_map)
+        features = calculate_nn_features(row) # 使用新的函数，只计算实时特征
         X.append(features)
 
     X = np.array(X)
@@ -430,11 +420,12 @@ def train_neural_network(df):
 
     return model, scaler
 
-def predict_score_with_nn(row, model, scaler, hist_data_map):
+def predict_score_with_nn(row, model, scaler):
     """
-    使用训练好的神经网络模型预测股票评分
+    使用训练好的神经网络模型预测股票评分。
+    注意：这里不再需要 hist_data_map，因为 NN 的输入特征不包含技术指标。
     """
-    features = calculate_all_features(row, hist_data_map)
+    features = calculate_nn_features(row) # 使用只包含实时特征的函数
     # 检查特征中是否有NaN或Inf，如果有，则返回一个默认值或NaN
     if any(pd.isna(f) or np.isinf(f) for f in features):
         return np.nan # 或者一个非常低的默认分数
@@ -452,9 +443,11 @@ def generate_strategy_signals(row, nn_score, tech_indicators):
     """
     根据神经网络评分和技术指标生成短期/长期买卖信号。
     nn_score: 神经网络预测的质量评分
-    tech_indicators: 该股票的技术指标字典
+    tech_indicators: 该股票的技术指标字典 (这里会用到，即使NN预测时没用)
     """
     signals = []
+    reasons = [] # 存储生成信号的原因
+
     current_price = safe_float(row.get('最新'))
     change_percent = safe_float(row.get('涨幅%'))
     turnover_rate = safe_float(row.get('实际换手%'))
@@ -471,6 +464,7 @@ def generate_strategy_signals(row, nn_score, tech_indicators):
     macd_dea = tech_indicators.get('MACD_DEA', np.nan)
     macd_hist = tech_indicators.get('MACD_HIST', np.nan)
     boll_up = tech_indicators.get('BOLL_UP', np.nan)
+    boll_mid = tech_indicators.get('BOLL_MID', np.nan)
     boll_low = tech_indicators.get('BOLL_LOW', np.nan)
     vol_ma5 = tech_indicators.get('VOL_MA5', np.nan)
     vol_ma10 = tech_indicators.get('VOL_MA10', np.nan)
@@ -478,81 +472,116 @@ def generate_strategy_signals(row, nn_score, tech_indicators):
 
     # 确保所有关键指标非NaN
     if pd.isna(nn_score) or pd.isna(current_price):
-        return ["数据不足，无法判断"]
+        return ["数据不足，无法判断"], ["核心数据缺失"]
 
-    # --- 买入信号 ---
-    # 1. 神经网络高评分
-    if nn_score > 0.7: # 阈值可调，0.7表示相对较高的质量评分
-        signals.append("NN高评分")
+    # --- 神经网络评分考量 ---
+    if nn_score > 0.85:
+        signals.append("强力买入")
+        reasons.append(f"NN评分极高 ({nn_score:.4f})，显示极佳的综合质量。")
+    elif nn_score > 0.7:
+        signals.append("买入")
+        reasons.append(f"NN评分较高 ({nn_score:.4f})，显示良好的综合质量。")
+    elif nn_score < 0.3:
+        signals.append("卖出")
+        reasons.append(f"NN评分较低 ({nn_score:.4f})，显示潜在风险或质量不佳。")
+    else:
+        signals.append("观望")
+        reasons.append(f"NN评分中等 ({nn_score:.4f})，需结合其他因素判断。")
 
-    # 2. 短期买入策略 (偏向动量和超跌反弹)
+    # --- 短期策略信号 (偏向动量和超跌反弹) ---
+    short_term_buy_reasons = []
+    short_term_sell_reasons = []
+
     if pd.notna(rsi) and pd.notna(macd_hist) and pd.notna(ma5) and pd.notna(ma10) and pd.notna(turnover_rate):
         # RSI超卖反弹
         if rsi < 30 and current_price > ma5:
-            signals.append("短期买入: RSI超卖反弹")
+            short_term_buy_reasons.append("RSI超卖后反弹，短期动能增强。")
         # MACD金叉
         if macd_dif > macd_dea and macd_hist > 0 and macd_dif < 0: # 金叉且在零轴下方
-            signals.append("短期买入: MACD金叉 (底部区域)")
+            short_term_buy_reasons.append("MACD在零轴下方形成金叉，可能处于底部反转区域。")
         # 价格突破短期均线
         if current_price > ma5 and ma5 > ma10 and change_percent > 2.0: # 价格站上5日线，5日线向上，且有一定涨幅
-            signals.append("短期买入: 价格突破短期均线")
+            short_term_buy_reasons.append("价格强势站上5日均线，且5日均线向上，短期趋势向好。")
         # 放量上涨
-        if vol_change > 0.5 and change_percent > 3.0: # 成交量放大50%且涨幅超过3%
-            signals.append("短期买入: 放量上涨")
+        if pd.notna(vol_change) and vol_change > 0.5 and change_percent > 3.0: # 成交量放大50%且涨幅超过3%
+            short_term_buy_reasons.append("成交量显著放大，配合价格上涨，显示资金积极介入。")
         # 价格接近布林带下轨并反弹
         if pd.notna(boll_low) and current_price > boll_low and (current_price - boll_low) / boll_low < 0.01 and change_percent > 0:
-            signals.append("短期买入: 布林带下轨支撑")
+            short_term_buy_reasons.append("价格触及布林带下轨后反弹，获得支撑。")
 
-    # 3. 长期买入策略 (偏向趋势和价值)
+        # RSI超买
+        if rsi > 70:
+            short_term_sell_reasons.append("RSI进入超买区域，短期回调风险增加。")
+        # MACD死叉
+        if macd_dif < macd_dea and macd_hist < 0 and macd_dif > 0: # 死叉且在零轴上方
+            short_term_sell_reasons.append("MACD在零轴上方形成死叉，短期上涨动能减弱。")
+        # 价格跌破短期均线
+        if current_price < ma5 and ma5 < ma10 and change_percent < -2.0:
+            short_term_sell_reasons.append("价格跌破5日均线，且5日均线向下，短期趋势转弱。")
+        # 价格跌破布林带中轨或下轨
+        if pd.notna(boll_mid) and current_price < boll_mid and change_percent < -1.0:
+            short_term_sell_reasons.append("价格跌破布林带中轨，短期支撑失效。")
+        if pd.notna(boll_low) and current_price < boll_low:
+            short_term_sell_reasons.append("价格跌破布林带下轨，可能进入下跌通道。")
+
+    if short_term_buy_reasons:
+        signals.append("短期买入")
+        reasons.append("短期技术面积极信号：" + " ".join(short_term_buy_reasons))
+    if short_term_sell_reasons:
+        signals.append("短期卖出")
+        reasons.append("短期技术面消极信号：" + " ".join(short_term_sell_reasons))
+
+    # --- 长期策略信号 (偏向趋势和价值) ---
+    long_term_buy_reasons = []
+    long_term_sell_reasons = []
+
     if pd.notna(ma60) and pd.notna(ma120) and pd.notna(ma200):
         # 长期均线多头排列 (或接近多头排列)
         if ma5 > ma10 > ma20 > ma60 and current_price > ma60:
-            signals.append("长期买入: 均线多头排列")
+            long_term_buy_reasons.append("均线呈多头排列，显示长期上涨趋势强劲。")
         # 价格站上长期均线
         if current_price > ma60 and ma60 > ma120 and ma120 > ma200:
-            signals.append("长期买入: 价格站上长期趋势线")
+            long_term_buy_reasons.append("价格站上长期均线，长期趋势稳健向上。")
         # 价值投资考量 (结合NN评分)
-        if nn_score > 0.8 and safe_float(row.get('市盈率(动)')) > 0 and safe_float(row.get('市盈率(动)')) < 30: # NN高评分且PE合理
-            signals.append("长期买入: 价值与成长兼备")
+        pe_ratio = safe_float(row.get('市盈率(动)'))
+        if nn_score > 0.8 and pd.notna(pe_ratio) and pe_ratio > 0 and pe_ratio < 30: # NN高评分且PE合理
+            long_term_buy_reasons.append("NN高评分结合合理市盈率，具备长期投资价值。")
 
-    # --- 卖出信号 ---
-    # 1. 短期卖出策略 (止盈/止损/动量衰竭)
-    if pd.notna(rsi) and pd.notna(macd_hist) and pd.notna(ma5) and pd.notna(ma10):
-        # RSI超买
-        if rsi > 70:
-            signals.append("短期卖出: RSI超买")
-        # MACD死叉
-        if macd_dif < macd_dea and macd_hist < 0 and macd_dif > 0: # 死叉且在零轴上方
-            signals.append("短期卖出: MACD死叉 (顶部区域)")
-        # 价格跌破短期均线
-        if current_price < ma5 and ma5 < ma10 and change_percent < -2.0:
-            signals.append("短期卖出: 价格跌破短期均线")
-        # 价格跌破布林带中轨或下轨
-        if pd.notna(boll_mid) and current_price < boll_mid and change_percent < -1.0:
-            signals.append("短期卖出: 跌破布林带中轨")
-        if pd.notna(boll_low) and current_price < boll_low:
-            signals.append("短期卖出: 跌破布林带下轨")
-
-    # 2. 长期卖出策略 (趋势反转/基本面恶化)
-    if pd.notna(ma60) and pd.notna(ma120):
         # 长期均线死叉
         if ma60 < ma120 and current_price < ma60:
-            signals.append("长期卖出: 长期均线死叉")
+            long_term_sell_reasons.append("长期均线形成死叉，长期趋势可能反转向下。")
         # 价格跌破长期趋势线
         if current_price < ma60 and ma60 < ma200:
-            signals.append("长期卖出: 价格跌破长期趋势线")
+            long_term_sell_reasons.append("价格跌破长期趋势线，长期支撑失效。")
         # 基本面恶化 (例如，净利润为负或大幅下降，这里需要更多历史财务数据来判断)
         if safe_float(row.get('归属净利润')) < 0 and safe_float(row.get('总市值')) > 0: # 亏损且非ST股
-            signals.append("长期卖出: 基本面恶化 (亏损)")
+            long_term_sell_reasons.append("公司归属净利润为负，基本面恶化，不适合长期持有。")
 
+    if long_term_buy_reasons:
+        signals.append("长期买入")
+        reasons.append("长期趋势/价值积极信号：" + " ".join(long_term_buy_reasons))
+    if long_term_sell_reasons:
+        signals.append("长期卖出")
+        reasons.append("长期趋势/价值消极信号：" + " ".join(long_term_sell_reasons))
+
+    # 如果没有明确的买卖信号，但NN评分中等，则建议观望
+    if not short_term_buy_reasons and not short_term_sell_reasons and \
+       not long_term_buy_reasons and not long_term_sell_reasons and \
+       "观望" not in signals:
+        signals.append("观望")
+        reasons.append("无明确技术或基本面信号，建议观望。")
+    
+    # 确保信号和原因列表不为空
     if not signals:
-        signals.append("无明确信号 (持有/观望)")
+        signals = ["无明确信号"]
+    if not reasons:
+        reasons = ["无具体原因"]
 
-    return signals
+    return signals, reasons
 
 def perform_association_rule_mining(df):
     """
-    使用关联规则挖掘来发现苏氏量化策略条件与高涨幅之间的关系。
+    使用关联规则挖掘来发现苏氏量化策略条件、基本面和技术指标与高涨幅之间的关系。
     """
     print("\n4. 执行关联规则挖掘...")
 
@@ -570,31 +599,35 @@ def perform_association_rule_mining(df):
         )
 
     for _, row in df.iterrows():
-        features_list = calculate_all_features(row, hist_data_map)
+        # 这里仍然使用 calculate_nn_features 获取基本面和苏氏策略特征
+        nn_features_list = calculate_nn_features(row)
         items = []
 
         # 苏氏量化策略特征
-        if features_list[0] == 1: items.append("F_价格位置_满足")
+        if nn_features_list[0] == 1: items.append("F_价格位置_满足")
         else: items.append("F_价格位置_不满足")
-        if features_list[1] == 1: items.append("G_涨幅位置_满足")
+        if nn_features_list[1] == 1: items.append("G_涨幅位置_满足")
         else: items.append("G_涨幅位置_不满足")
 
         # 基本面特征
-        if features_list[2] >= 0.3: items.append("H_净利润_高") # 0.3亿
+        if nn_features_list[2] >= 0.3: items.append("H_净利润_高") # 0.3亿
         else: items.append("H_净利润_低")
-        if features_list[3] <= 20: items.append("I_换手率_低") # 20%
+        if nn_features_list[3] <= 20: items.append("I_换手率_低") # 20%
         else: items.append("I_换手率_高")
-        if features_list[4] >= 300: items.append("J_市值_大") # 300亿
+        if nn_features_list[4] >= 300: items.append("J_市值_大") # 300亿
         else: items.append("J_市值_小")
-        if features_list[5] > 0 and features_list[5] < 50: items.append("K_市盈率_合理") # 0-50
+        if nn_features_list[5] > 0 and nn_features_list[5] < 50: items.append("K_市盈率_合理") # 0-50
         else: items.append("K_市盈率_不合理")
 
-        # 技术指标特征 (二值化)
+        # 技术指标特征 (二值化) - 关联规则挖掘可以继续使用技术指标来发现模式
+        symbol = row.get('原始代码')
+        tech_indicators = hist_data_map.get(symbol, {})
+
         current_price = safe_float(row.get('最新'))
-        ma20 = features_list[8] # MA20
-        ma60 = features_list[9] # MA60
-        rsi = features_list[11] # RSI
-        macd_hist = features_list[14] # MACD_HIST
+        ma20 = tech_indicators.get('MA20', np.nan)
+        ma60 = tech_indicators.get('MA60', np.nan)
+        rsi = tech_indicators.get('RSI', np.nan)
+        macd_hist = tech_indicators.get('MACD_HIST', np.nan)
 
         if pd.notna(current_price) and pd.notna(ma20) and current_price > ma20: items.append("技术_价格高于MA20")
         else: items.append("技术_价格低于MA20")
@@ -781,6 +814,7 @@ def main():
     for col in ['最新', '涨幅%', '最高', '最低', '开盘', '昨收', '实际换手%', '20日均价', '60日均价', '市盈率(动)', '总市值', '归属净利润']:
         df_for_training[col] = df_for_training[col].apply(safe_float)
 
+    # 神经网络训练时，其输入特征不再包含技术指标
     model, scaler = train_neural_network(df_for_training)
 
     if model is None:
@@ -798,24 +832,35 @@ def main():
         df_for_scoring[col] = df_for_scoring[col].apply(safe_float)
     df_for_scoring['原始代码'] = df_for_scoring['代码'].apply(lambda x: str(x).replace('= "', '').replace('"', ''))
 
-    # 预先获取所有股票的历史数据，避免循环中重复获取
+    # 预先获取所有股票的历史数据，用于计算技术指标 (供策略报告使用)
     today_str = datetime.now().strftime('%Y%m%d')
     start_date_hist = (datetime.now() - timedelta(days=300)).strftime('%Y%m%d') # 足够长的时间来计算200日均线
     
     all_tech_indicators_map = {}
-    print("   正在获取所有股票历史数据并计算技术指标...")
+    print("   正在获取所有股票历史数据并计算技术指标 (供策略报告使用)...")
+    # 统计成功和失败的数量
+    success_count = 0
+    fail_count = 0
     for symbol in df_for_scoring['原始代码'].unique():
-        all_tech_indicators_map[symbol] = calculate_technical_indicators(
+        tech_data = calculate_technical_indicators(
             get_stock_history_data(symbol, start_date_hist, today_str)
         )
-    print("   ✅ 技术指标计算完成。")
+        if tech_data and not all(pd.isna(v) for v in tech_data.values()): # 检查是否成功获取到有效指标
+            all_tech_indicators_map[symbol] = tech_data
+            success_count += 1
+        else:
+            fail_count += 1
+    print(f"   ✅ 技术指标计算完成。成功获取 {success_count} 只股票，失败 {fail_count} 只。")
 
     for idx, row in df_for_scoring.iterrows():
         symbol = str(row['原始代码']).strip()
         tech_indicators = all_tech_indicators_map.get(symbol, {}) # 获取该股票的技术指标
 
-        nn_score = predict_score_with_nn(row, model, scaler, all_tech_indicators_map)
-        signals = generate_strategy_signals(row, nn_score, tech_indicators)
+        # 神经网络预测，不使用历史技术指标作为输入
+        nn_score = predict_score_with_nn(row, model, scaler)
+        
+        # 生成策略信号，这里会结合NN评分和技术指标
+        signals, reasons = generate_strategy_signals(row, nn_score, tech_indicators)
         
         if pd.notna(nn_score): # 确保分数有效
             quality_stocks.append({
@@ -824,7 +869,8 @@ def main():
                 '行业': str(row['所属行业']).strip(),
                 '优质率': nn_score,
                 '今日涨幅': f"{safe_float(row['涨幅%']):.2f}%" if pd.notna(safe_float(row['涨幅%'])) else "--",
-                '策略信号': ", ".join(signals)
+                '策略信号': ", ".join(signals),
+                '策略原因': "\n".join([f"- {r}" for r in reasons]) # 格式化原因列表
             })
 
     # 按优质率降序排序
@@ -843,10 +889,12 @@ def main():
         quality_stocks_filtered = []
 
     # 保存优质股票和策略信号
-    output_file2 = '输出数据/优质股票与策略信号.txt'
+    output_file2 = '输出数据/优质股票与策略报告.txt'
     with open(output_file2, 'w', encoding='utf-8') as f:
-        f.write("苏氏量化策略 - 优质股票筛选结果 (神经网络评分与策略信号)\n")
+        f.write("苏氏量化策略 - 优质股票筛选结果 (神经网络评分与详细策略报告)\n")
         f.write(f"筛选时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"神经网络评分基于实时基本面和苏氏量化特征。\n")
+        f.write(f"策略信号结合了NN评分和技术指标（技术指标不作为NN评分的直接输入）。\n")
         f.write(f"最低优质率阈值 (基于前{display_count}名或全部): {threshold:.4f}\n")
         f.write(f"优质股票数量: {len(quality_stocks_filtered)}\n")
         f.write("="*80 + "\n\n")
@@ -858,18 +906,23 @@ def main():
             f.write(f"优质率 (NN评分): {stock['优质率']:.4f}\n")
             f.write(f"今日涨幅: {stock['今日涨幅']}\n")
             f.write(f"策略信号: {stock['策略信号']}\n")
+            f.write(f"策略原因:\n{stock['策略原因']}\n")
             f.write("-"*40 + "\n")
 
-    print(f"\n✅ 优质股票与策略信号已保存: {output_file2}")
+    print(f"\n✅ 优质股票与策略报告已保存: {output_file2}")
     print(f"   找到 {len(quality_stocks_filtered)} 只优质股票（最低优质率={threshold:.4f}）")
 
     if len(quality_stocks_filtered) > 0:
-        print(f"\n🎯 今日优质股票列表及策略信号 (前{len(quality_stocks_filtered)}名)：")
-        print("="*100)
-        print(f"{'股票代码':<10} {'股票名称':<12} {'涨幅':<8} {'优质率':<10} {'所属行业':<15} {'策略信号':<40}")
-        print("-"*100)
+        print(f"\n🎯 今日优质股票列表及策略报告 (前{len(quality_stocks_filtered)}名)：")
+        print("="*120)
+        print(f"{'股票代码':<10} {'股票名称':<12} {'涨幅':<8} {'优质率':<10} {'所属行业':<15} {'策略信号':<20} {'策略原因':<40}")
+        print("-"*120)
         for stock in quality_stocks_filtered:
-            print(f"{stock['代码']:<10} {stock['名称']:<12} {stock['今日涨幅']:<8} {stock['优质率']:.4f}   {stock['行业']:<15} {stock['策略信号']:<40}")
+            # 为了在控制台打印时避免过长，策略原因只取第一行
+            display_reason = stock['策略原因'].split('\n')[0].replace('- ', '')
+            if len(display_reason) > 38:
+                display_reason = display_reason[:35] + "..."
+            print(f"{stock['代码']:<10} {stock['名称']:<12} {stock['今日涨幅']:<8} {stock['优质率']:.4f}   {stock['行业']:<15} {stock['策略信号']:<20} {display_reason:<40}")
     else:
         print("\n⚠️ 今日没有找到符合条件的优质股票")
         print("   可能原因：")
@@ -879,7 +932,7 @@ def main():
         print("   4. 策略信号条件过于严格")
 
     # ========== 第四步：关联规则挖掘 ==========
-    # 在这里调用关联规则挖掘函数
+    # 关联规则挖掘可以继续使用技术指标来发现模式，因为它提供的是洞察，而不是实时预测的输入
     perform_association_rule_mining(df_for_scoring.copy()) # 传入原始数值的df副本
 
     print("\n" + "="*60)
