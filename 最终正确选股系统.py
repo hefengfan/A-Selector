@@ -3,6 +3,7 @@
 """
 动态选股系统 - 根据每天实时数据筛选
 基于苏氏量化策略的真实计算逻辑
+集成神经网络进行精准评分
 """
 
 import akshare as ak
@@ -13,6 +14,12 @@ import os
 import warnings
 warnings.filterwarnings('ignore')
 
+# 导入神经网络相关库
+from sklearn.neural_network import MLPRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error
+
 # 清除代理设置
 os.environ['HTTP_PROXY'] = ''
 os.environ['HTTPS_PROXY'] = ''
@@ -20,140 +27,198 @@ os.environ['ALL_PROXY'] = ''
 os.environ['NO_PROXY'] = '*'
 
 
-def calculate_score(row):
+def calculate_features(row):
     """
-    根据苏氏量化策略计算得分
-    注意：这里使用宽松的条件以匹配Excel的实际行为
+    根据苏氏量化策略计算特征值，用于神经网络训练
     """
-    score = 0
-    details = []
-    
-    # F列：价格位置条件（1000分）
-    # 根据实际数据分析，这个条件可能更宽松
+    features = []
+
+    # F列：价格位置条件
     try:
         low_str = str(row['最低']).strip()
         ma60_str = str(row['60日均价']).strip()
         ma20_str = str(row['20日均价']).strip()
         current_str = str(row['最新']).strip()
-        
+
         if '--' not in low_str and '--' not in ma60_str:
             low = float(low_str)
             ma60 = float(ma60_str)
             current = float(current_str)
             ma20 = float(ma20_str) if '--' not in ma20_str else 0
-            
-            # 多种可能的条件（根据实际数据调整）
+
             condition_met = False
-            
-            # 条件1：最低价在60日均价附近（放宽到15%）
-            if ma60 > 0 and 0.85 <= low/ma60 <= 1.15:
+            if ma60 > 0 and 0.85 <= low / ma60 <= 1.15:
                 condition_met = True
-            
-            # 条件2：现价在20日均价附近（备选）
-            if not condition_met and ma20 > 0 and 0.90 <= current/ma20 <= 1.10:
+            if not condition_met and ma20 > 0 and 0.90 <= current / ma20 <= 1.10:
                 condition_met = True
-            
-            if condition_met:
-                score += 1000
-                details.append('F')
+
+            features.append(1 if condition_met else 0)  # 1 or 0
+        else:
+            features.append(0)
     except:
-        pass
-    
-    # G列：涨幅和价格位置（1000分）
+        features.append(0)
+
+    # G列：涨幅和价格位置
     try:
         change_str = str(row['涨幅%']).strip()
         current_str = str(row['最新']).strip()
         high_str = str(row['最高']).strip()
         low_str = str(row['最低']).strip()
-        
+
         if '--' not in change_str:
             change = float(change_str)
             current = float(current_str)
             high = float(high_str)
             low = float(low_str)
-            
-            # 涨幅条件（可能需要调整阈值）
-            if change >= 5.0:  # 降低到5%试试
-                threshold = high - (high - low) * 0.30  # 放宽到30%
-                if current >= threshold:
-                    score += 1000
-                    details.append('G')
+
+            if change >= 5.0:
+                threshold = high - (high - low) * 0.30
+                features.append(1 if current >= threshold else 0)
+            else:
+                features.append(0)
+        else:
+            features.append(0)
     except:
-        pass
-    
-    # H列：净利润>=3000万（100分）
+        features.append(0)
+
+    # H列：净利润>=3000万
     try:
         profit_str = str(row['归属净利润']).strip()
         profit = 0
-        
+
         if '亿' in profit_str:
             profit = float(profit_str.replace('亿', ''))
         elif '万' in profit_str:
             profit = float(profit_str.replace('万', '')) / 10000
-            
-        if profit >= 0.3:  # 0.3亿=3000万
-            score += 100
-            details.append('H')
+
+        features.append(profit)  # 直接使用净利润数值
     except:
-        pass
-    
-    # I列：换手率<=20%（10分）
+        features.append(0)
+
+    # I列：换手率<=20%
     try:
         turnover_str = str(row['实际换手%']).strip()
         if '--' not in turnover_str:
             turnover = float(turnover_str)
-            # 放宽到25%
-            if turnover <= 25:
-                score += 10
-                details.append('I')
+            features.append(turnover)  # 直接使用换手率数值
+        else:
+            features.append(100) # 换手率缺失时，赋予一个较大的值
     except:
-        pass
-    
-    # J列：市值>=300亿（1分）
+        features.append(100)
+
+    # J列：市值>=300亿
     try:
         cap_str = str(row['总市值']).strip()
         cap = 0
-        
+
         if '万亿' in cap_str:
             cap = float(cap_str.replace('万亿', '')) * 10000
         elif '亿' in cap_str:
             cap = float(cap_str.replace('亿', ''))
-            
-        # 放宽到200亿
-        if cap >= 200:
-            score += 1
-            details.append('J')
+
+        features.append(cap)  # 直接使用市值数值
     except:
-        pass
-    
-    return score, '+'.join(details)
+        features.append(0)
+
+    return features
+
+
+def train_neural_network(df):
+    """
+    训练神经网络模型，预测股票评分
+    """
+
+    # 1. 准备训练数据
+    print("\n   准备训练数据...")
+    X = []
+    y = []  # 目标变量：涨幅作为评分的依据
+    for _, row in df.iterrows():
+        features = calculate_features(row)
+        X.append(features)
+
+        # 使用涨幅作为目标变量，也可以考虑其他指标
+        try:
+            change_str = str(row['涨幅%']).strip()
+            if '--' not in change_str:
+                y.append(float(change_str))
+            else:
+                y.append(0)  # 缺失涨幅时，赋予0
+        except:
+            y.append(0)
+
+    X = np.array(X)
+    y = np.array(y)
+
+    # 移除包含 NaN 或无穷大的行
+    mask = ~np.any(np.isnan(X) | np.isinf(X), axis=1)
+    X = X[mask]
+    y = y[mask]
+
+    if len(X) == 0:
+        print("   ❌ 没有有效的训练数据，无法训练神经网络。")
+        return None, None
+
+    # 2. 数据预处理
+    print("   数据预处理...")
+    scaler = StandardScaler()
+    X = scaler.fit_transform(X)
+
+    # 3. 划分训练集和测试集
+    print("   划分训练集和测试集...")
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    # 4. 构建和训练神经网络模型
+    print("   构建和训练神经网络模型...")
+    model = MLPRegressor(hidden_layer_sizes=(64, 32), activation='relu', solver='adam',
+                         random_state=42, max_iter=500, early_stopping=True)  # 调整参数
+    model.fit(X_train, y_train)
+
+    # 5. 评估模型
+    print("   评估模型...")
+    y_pred = model.predict(X_test)
+    mse = mean_squared_error(y_test, y_pred)
+    print(f"   均方误差 (MSE): {mse:.4f}")
+
+    return model, scaler
+
+
+def predict_score_with_nn(row, model, scaler):
+    """
+    使用训练好的神经网络模型预测股票评分
+    """
+    features = calculate_features(row)
+    features = np.array(features).reshape(1, -1)  # 转换为二维数组
+    features_scaled = scaler.transform(features)
+    score = model.predict(features_scaled)[0]
+    return score
 
 
 def main():
     """主程序"""
     print("\n" + "="*60)
     print("动态选股系统 - 实时计算版")
+    print("集成神经网络进行精准评分")
     print(f"运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("="*60)
-    
+
     # 创建输出目录
     os.makedirs('输出数据', exist_ok=True)
-    
+
     # ========== 第一步：获取数据 ==========
     print("\n1. 获取A股数据...")
-    
+
     # 先尝试获取实时数据
     try:
         print("   尝试获取实时数据...")
         df = ak.stock_zh_a_spot_em()
         print(f"   ✅ 成功获取 {len(df)} 只股票的实时数据")
-        
+
         # 保存原始代码
         df['原始代码'] = df['代码'].copy()
-        
+
         # 格式化代码
         df['代码'] = df['代码'].apply(lambda x: f'= "{str(x)}"')
-        
+
         # 格式化数值列
         for col in ['最新价', '最高', '最低', '开盘', '昨收']:
             if col in df.columns:
@@ -161,20 +226,20 @@ def main():
                 df[new_col] = df[col].apply(
                     lambda x: f" {float(x):.2f}" if pd.notna(x) and str(x) not in ['--', '', None] else " --"
                 )
-        
+
         if '涨跌幅' in df.columns:
             df['涨幅%'] = df['涨跌幅'].apply(
                 lambda x: f" {float(x):.2f}" if pd.notna(x) else " --"
             )
-        
+
         if '换手率' in df.columns:
             df['实际换手%'] = df['换手率'].apply(
                 lambda x: f" {float(x):.2f}" if pd.notna(x) else " --"
             )
-        
+
         # 处理名称
         df['名称'] = df['名称'].apply(lambda x: f" {x}" if not str(x).startswith(' ') else x)
-        
+
         # 设置默认值
         df['所属行业'] = '  其他'
         df['20日均价'] = ' --'
@@ -182,11 +247,11 @@ def main():
         df['归属净利润'] = ' --'
         df['市盈率(动)'] = ' --'
         df['总市值'] = ' --'
-        
+
     except Exception as e:
         print(f"   ❌ 实时获取失败: {e}")
         print("   使用参考数据作为备选...")
-        
+
         # 使用参考数据
         try:
             df = pd.read_csv('参考数据/Table.xls', sep='\t', encoding='gbk', dtype=str)
@@ -195,7 +260,7 @@ def main():
         except Exception as e2:
             print(f"   ❌ 无法加载参考数据: {e2}")
             return
-    
+
     # 尝试补充均线和财务数据
     try:
         ref_df = pd.read_csv('参考数据/Table.xls', sep='\t', encoding='gbk', dtype=str)
@@ -203,7 +268,7 @@ def main():
         for _, row in ref_df.iterrows():
             code = str(row['代码']).replace('= "', '').replace('"', '')
             ref_map[code] = row.to_dict()
-        
+
         # 合并参考数据
         for i, code in enumerate(df.get('原始代码', [])):
             if code in ref_map:
@@ -212,51 +277,64 @@ def main():
                 for col in ['20日均价', '60日均价', '所属行业', '归属净利润', '总市值', '市盈率(动)']:
                     if col in ref:
                         df.loc[i, col] = ref[col]
-        
+
         print(f"   ✅ 补充了 {len(ref_map)} 条参考数据")
     except:
         print("   ⚠️ 无法补充参考数据")
-    
+
     # 添加序号
     df['序'] = range(1, len(df) + 1)
     df['Unnamed: 16'] = ''
-    
+
     # 选择输出列
     output_columns = [
         '序', '代码', '名称', '最新', '涨幅%', '最高', '最低',
         '实际换手%', '所属行业', '20日均价', '60日均价',
         '市盈率(动)', '总市值', '归属净利润', '昨收', '开盘', 'Unnamed: 16'
     ]
-    
+
     for col in output_columns:
         if col not in df.columns:
             df[col] = ' --' if col != 'Unnamed: 16' else ''
-    
+
     final_df = df[output_columns]
-    
+
     # 保存A股数据
     output_file1 = '输出数据/A股数据.csv'
     final_df.to_csv(output_file1, index=False, encoding='utf-8-sig')
     print(f"\n✅ A股数据已保存: {output_file1}")
     print(f"   共 {len(final_df)} 只股票")
-    
-    # ========== 第二步：动态筛选优质股票 ==========
-    print("\n2. 动态筛选优质股票...")
-    
+
+    # ========== 第二步：训练神经网络 ==========
+    print("\n2. 训练神经网络模型...")
+    model, scaler = train_neural_network(final_df)
+
+    if model is None:
+        print("   ❌ 神经网络训练失败，无法进行后续筛选。")
+        return
+
+    # ========== 第三步：动态筛选优质股票 ==========
+    print("\n3. 动态筛选优质股票...")
+
     quality_stocks = []
-    threshold = 2100  # 降低阈值以获得更多结果
-    
+    threshold = 0.0 # 调整阈值以获得更多结果
+
     # 统计
     stats = {'F': 0, 'G': 0, 'H': 0, 'I': 0, 'J': 0}
-    
+
     for idx, row in final_df.iterrows():
-        score, conditions = calculate_score(row)
-        
-        # 统计
-        for cond in ['F', 'G', 'H', 'I', 'J']:
-            if cond in conditions:
-                stats[cond] += 1
-        
+        # score, conditions = calculate_score(row)  # 使用原始评分方法
+        score = predict_score_with_nn(row, model, scaler) # 使用神经网络预测评分
+        conditions = "" # 神经网络评分不需要条件
+
+        # 统计（原始评分方式的统计，如果只用神经网络，可以移除）
+        features = calculate_features(row)
+        if features[0] == 1: stats['F'] += 1
+        if features[1] == 1: stats['G'] += 1
+        if features[2] > 0.3: stats['H'] += 1
+        if features[3] <= 25: stats['I'] += 1
+        if features[4] >= 200: stats['J'] += 1
+
         # 判断是否达标
         if score >= threshold:
             code = str(row['代码']).replace('= "', '').replace('"', '')
@@ -268,7 +346,7 @@ def main():
                 '满足条件': conditions,
                 '涨幅': str(row['涨幅%']).strip()
             })
-    
+
     # 打印统计
     total = len(final_df)
     if total > 0:
@@ -278,18 +356,18 @@ def main():
         print(f"   H列(净利润): {stats['H']}只 ({stats['H']/total*100:.1f}%)")
         print(f"   I列(换手率): {stats['I']}只 ({stats['I']/total*100:.1f}%)")
         print(f"   J列(市值): {stats['J']}只 ({stats['J']/total*100:.1f}%)")
-    
+
     # 按优质率降序排序
     quality_stocks = sorted(quality_stocks, key=lambda x: (x['优质率'], x['代码']), reverse=True)
-    
+
     # 如果结果太少，尝试降低阈值
     if len(quality_stocks) < 10:
         print(f"\n   ⚠️ 只找到{len(quality_stocks)}只股票，尝试降低阈值...")
-        threshold = 1100
+        threshold = np.percentile([stock['优质率'] for stock in quality_stocks], 25) if quality_stocks else 0 # 使用25%分位数作为阈值
         quality_stocks = []
-        
+
         for idx, row in final_df.iterrows():
-            score, conditions = calculate_score(row)
+            score = predict_score_with_nn(row, model, scaler)
             if score >= threshold:
                 code = str(row['代码']).replace('= "', '').replace('"', '')
                 quality_stocks.append({
@@ -297,48 +375,48 @@ def main():
                     '名称': str(row['名称']).strip(),
                     '行业': str(row['所属行业']).strip(),
                     '优质率': score,
-                    '满足条件': conditions,
+                    '满足条件': "", # 神经网络评分不需要条件
                     '涨幅': str(row['涨幅%']).strip()
                 })
-        
+
         quality_stocks = sorted(quality_stocks, key=lambda x: (x['优质率'], x['代码']), reverse=True)
         quality_stocks = quality_stocks[:12]  # 只取前12只
-    
+
     # 保存优质股票
     output_file2 = '输出数据/优质股票.txt'
     with open(output_file2, 'w', encoding='utf-8') as f:
-        f.write("苏氏量化策略 - 优质股票筛选结果\n")
+        f.write("苏氏量化策略 - 优质股票筛选结果 (神经网络评分)\n")
         f.write(f"筛选时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"筛选阈值: {threshold}\n")
+        f.write(f"筛选阈值: {threshold:.4f}\n") # 显示神经网络的阈值
         f.write(f"优质股票数量: {len(quality_stocks)}\n")
         f.write("="*50 + "\n\n")
-        
+
         for stock in quality_stocks:
             f.write(f"股票代码: {stock['代码']}\n")
             f.write(f"股票名称: {stock['名称']}\n")
             f.write(f"所属行业: {stock['行业']}\n")
-            f.write(f"优质率: {stock['优质率']}\n")
+            f.write(f"优质率: {stock['优质率']:.4f}\n") # 显示神经网络的评分
             f.write(f"满足条件: {stock['满足条件']}\n")
             f.write(f"今日涨幅: {stock['涨幅']}\n")
             f.write("-"*30 + "\n")
-    
+
     print(f"\n✅ 优质股票已保存: {output_file2}")
-    print(f"   找到 {len(quality_stocks)} 只优质股票（阈值={threshold}）")
-    
+    print(f"   找到 {len(quality_stocks)} 只优质股票（阈值={threshold:.4f}）") # 显示神经网络的阈值
+
     if len(quality_stocks) > 0:
         print(f"\n🎯 今日优质股票列表：")
         print("="*60)
         print("股票代码    股票名称        涨幅%      优质率")
         print("-"*60)
         for stock in quality_stocks[:12]:
-            print(f"{stock['代码']:8}    {stock['名称']:12}    {stock['涨幅']:6}    {stock['优质率']}")
+            print(f"{stock['代码']:8}    {stock['名称']:12}    {stock['涨幅']:6}    {stock['优质率']:.4f}") # 显示神经网络的评分
     else:
         print("\n⚠️ 今日没有找到符合条件的优质股票")
         print("   可能原因：")
         print("   1. 市场整体表现不佳，涨幅不足")
         print("   2. 数据获取不完整")
         print("   3. 筛选条件过于严格")
-    
+
     print("\n" + "="*60)
     print("✅ 程序执行完成！")
     print("="*60)
