@@ -31,99 +31,85 @@ os.environ['HTTPS_PROXY'] = ''
 os.environ['ALL_PROXY'] = ''
 os.environ['NO_PROXY'] = '*'
 
+# 定义需要转换为数值的列
+NUMERIC_COLS = [
+    '最新', '涨幅%', '最高', '最低', '实际换手%', '20日均价', '60日均价',
+    '归属净利润', '总市值', '市盈率(动)', '昨收', '开盘'
+]
+
+def clean_and_convert_numeric(df, cols_to_convert):
+    """
+    将指定列转换为数值类型，并处理缺失值。
+    """
+    for col in cols_to_convert:
+        if col in df.columns:
+            # 尝试替换常见的非数值表示
+            df[col] = df[col].astype(str).str.replace('--', '0').str.replace(' ', '').str.replace(',', '')
+
+            # 处理亿、万亿等单位
+            def parse_value(val):
+                if '万亿' in val:
+                    return float(val.replace('万亿', '')) * 1_000_000_000_000
+                elif '亿' in val:
+                    return float(val.replace('亿', '')) * 1_000_000_00
+                elif '万' in val:
+                    return float(val.replace('万', '')) * 10_000
+                return val
+
+            df[col] = df[col].apply(parse_value)
+
+            # 转换为数值，无法转换的设为NaN
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            # 填充NaN，这里选择0，也可以根据实际情况选择中位数或均值
+            df[col] = df[col].fillna(0)
+    return df
+
 
 def calculate_features(row):
     """
-    根据苏氏量化策略计算特征值，用于神经网络训练
+    根据苏氏量化策略计算特征值，直接使用数值列
     """
     features = []
 
     # F列：价格位置条件
-    try:
-        low_str = str(row['最低']).strip()
-        ma60_str = str(row['60日均价']).strip()
-        ma20_str = str(row['20日均价']).strip()
-        current_str = str(row['最新']).strip()
+    low = row['最低']
+    ma60 = row['60日均价']
+    ma20 = row['20日均价']
+    current = row['最新']
 
-        if '--' not in low_str and '--' not in ma60_str:
-            low = float(low_str)
-            ma60 = float(ma60_str)
-            current = float(current_str)
-            ma20 = float(ma20_str) if '--' not in ma20_str else 0
-
-            condition_met = False
-            if ma60 > 0 and 0.85 <= low / ma60 <= 1.15:
-                condition_met = True
-            if not condition_met and ma20 > 0 and 0.90 <= current / ma20 <= 1.10:
-                condition_met = True
-
-            features.append(1 if condition_met else 0)  # 1 or 0
-        else:
-            features.append(0)
-    except:
-        features.append(0)
+    condition_met_F = 0
+    if ma60 > 0 and 0.85 <= low / ma60 <= 1.15:
+        condition_met_F = 1
+    elif ma20 > 0 and 0.90 <= current / ma20 <= 1.10:
+        condition_met_F = 1
+    features.append(condition_met_F)
 
     # G列：涨幅和价格位置
-    try:
-        change_str = str(row['涨幅%']).strip()
-        current_str = str(row['最新']).strip()
-        high_str = str(row['最高']).strip()
-        low_str = str(row['最低']).strip()
+    change = row['涨幅%']
+    high = row['最高']
+    low_price = row['最低'] # 避免变量名冲突
+    current_price = row['最新'] # 避免变量名冲突
 
-        if '--' not in change_str:
-            change = float(change_str)
-            current = float(current_str)
-            high = float(high_str)
-            low = float(low_str)
+    condition_met_G = 0
+    if change >= 5.0:
+        # 确保 high 和 low_price 是有效数字，避免除以0或NaN
+        if high > low_price:
+            threshold = high - (high - low_price) * 0.30
+            if current_price >= threshold:
+                condition_met_G = 1
+    features.append(condition_met_G)
 
-            if change >= 5.0:
-                threshold = high - (high - low) * 0.30
-                features.append(1 if current >= threshold else 0)
-            else:
-                features.append(0)
-        else:
-            features.append(0)
-    except:
-        features.append(0)
-
-    # H列：净利润>=3000万
-    try:
-        profit_str = str(row['归属净利润']).strip()
-        profit = 0
-
-        if '亿' in profit_str:
-            profit = float(profit_str.replace('亿', ''))
-        elif '万' in profit_str:
-            profit = float(profit_str.replace('万', '')) / 10000
-
-        features.append(profit)  # 直接使用净利润数值
-    except:
-        features.append(0)
+    # H列：净利润>=3000万 (0.3亿)
+    profit = row['归属净利润']
+    features.append(profit)
 
     # I列：换手率<=20%
-    try:
-        turnover_str = str(row['实际换手%']).strip()
-        if '--' not in turnover_str:
-            turnover = float(turnover_str)
-            features.append(turnover)  # 直接使用换手率数值
-        else:
-            features.append(100) # 换手率缺失时，赋予一个较大的值
-    except:
-        features.append(100)
+    turnover = row['实际换手%']
+    features.append(turnover)
 
     # J列：市值>=300亿
-    try:
-        cap_str = str(row['总市值']).strip()
-        cap = 0
-
-        if '万亿' in cap_str:
-            cap = float(cap_str.replace('万亿', '')) * 10000
-        elif '亿' in cap_str:
-            cap = float(cap_str.replace('亿', ''))
-
-        features.append(cap)  # 直接使用市值数值
-    except:
-        features.append(0)
+    cap = row['总市值']
+    features.append(cap)
 
     return features
 
@@ -139,7 +125,7 @@ def create_model(trial, input_shape):
         hidden_layer_sizes.append(num_units)
 
     activation = trial.suggest_categorical('activation', ['relu', 'tanh', 'logistic', 'identity']) # 增加激活函数
-    solver = trial.suggest_categorical('solver', ['adam', 'lbfgs']) # 移除 'sgd'，lbfgs 不需要 learning_rate
+    solver = trial.suggest_categorical('solver', ['adam', 'lbfgs'])
     alpha = trial.suggest_float('alpha', 1e-6, 1e-1, log=True)  # 调整 alpha 范围
     learning_rate_init = trial.suggest_float('learning_rate_init', 1e-4, 1e-2, log=True) # 调整学习率
 
@@ -149,8 +135,10 @@ def create_model(trial, input_shape):
                          alpha=alpha,
                          learning_rate_init=learning_rate_init,
                          random_state=42,
-                         max_iter=300,  # 限制迭代次数
-                         early_stopping=True) # 启用早停
+                         max_iter=500,  # 增加迭代次数
+                         early_stopping=True, # 启用早停
+                         n_iter_no_change=20, # 增加容忍度
+                         tol=1e-4) # 增加收敛容忍度
 
     return model
 
@@ -163,13 +151,12 @@ def objective(trial, X_train, y_train, X_test, y_test):
     model.fit(X_train, y_train)
     y_pred = model.predict(X_test)
     mse = mean_squared_error(y_test, y_pred)
-
-    #  添加 R^2 作为辅助评估指标
     r2 = r2_score(y_test, y_pred)
 
-    #  综合 MSE 和 R^2，鼓励两者都表现良好
-    #  可以根据实际情况调整权重
-    return mse - r2 * 0.1  # 最小化 MSE，同时最大化 R^2
+    # 尝试优化R2分数，因为R2更能体现模型的解释能力
+    # Optuna 默认是最小化，所以我们最小化 (1 - R2)
+    # 也可以尝试最小化 MSE
+    return 1 - r2
 
 
 def train_neural_network(df):
@@ -181,31 +168,30 @@ def train_neural_network(df):
     print("\n   准备训练数据...")
     X = []
     y = []  # 目标变量：涨幅作为评分的依据
-    for _, row in df.iterrows():
+
+    # 确保所有特征列和目标列都是数值类型且无NaN
+    df_for_nn = df.copy()
+    # 确保 calculate_features 依赖的列都是数值
+    df_for_nn = clean_and_convert_numeric(df_for_nn, NUMERIC_COLS)
+
+    for _, row in df_for_nn.iterrows():
         features = calculate_features(row)
         X.append(features)
+        y.append(row['涨幅%']) # 涨幅% 已经通过 clean_and_convert_numeric 处理过
 
-        # 使用涨幅作为目标变量，也可以考虑其他指标
-        try:
-            change_str = str(row['涨幅%']).strip()
-            if '--' not in change_str:
-                y.append(float(change_str))
-            else:
-                y.append(0)  # 缺失涨幅时，赋予0
-        except:
-            y.append(0)
+    X = np.array(X, dtype=np.float32)
+    y = np.array(y, dtype=np.float32)
 
-    X = np.array(X)
-    y = np.array(y)
+    # 联合清洗 X 和 y，移除包含 NaN 或无穷大的行
+    combined_mask = ~np.any(np.isnan(X) | np.isinf(X), axis=1) & \
+                    ~np.isnan(y) & ~np.isinf(y)
 
-    # 移除包含 NaN 或无穷大的行
-    mask = ~np.any(np.isnan(X) | np.isinf(X), axis=1)
-    X = X[mask]
-    y = y[mask]
+    X = X[combined_mask]
+    y = y[combined_mask]
 
     if len(X) == 0:
         print("   ❌ 没有有效的训练数据，无法训练神经网络。")
-        return None, None
+        return None, None, 0 # 返回0作为R2分数
 
     # 2. 数据预处理
     print("   数据预处理...")
@@ -218,13 +204,19 @@ def train_neural_network(df):
 
     # 4. 使用 Optuna 优化超参数
     print("   使用 Optuna 优化超参数...")
-    study = optuna.create_study(direction='minimize')
+    study = optuna.create_study(direction='minimize') # 最小化 (1-R2)
 
-    # 使用 partial 减少 objective 函数的重复代码
     from functools import partial
     objective_partial = partial(objective, X_train=X_train, y_train=y_train, X_test=X_test, y_test=y_test)
 
-    study.optimize(objective_partial, n_trials=20, timeout=120)  # 限制时间和 trials，增加 trials 和 timeout
+    try:
+        study.optimize(objective_partial, n_trials=30, timeout=180)  # 增加 trials 和 timeout
+    except Exception as e:
+        print(f"   ⚠️ Optuna 优化过程中发生错误: {e}")
+        print("   将使用默认参数或已找到的最佳参数。")
+        if not study.trials: # 如果没有成功运行任何trial
+            print("   ❌ Optuna 未能完成任何 trial，无法得到最佳参数。")
+            return None, None, 0
 
     # 5. 使用最佳超参数创建模型
     print("   使用最佳超参数创建模型...")
@@ -249,6 +241,8 @@ def predict_score_with_nn(row, model, scaler):
     """
     使用训练好的 Scikit-learn 神经网络模型预测股票评分
     """
+    # 确保 row 中的特征是数值类型
+    # 注意：这里假设 row 已经经过了 clean_and_convert_numeric 处理
     features = calculate_features(row)
     features = np.array(features).reshape(1, -1)  # 转换为二维数组
 
@@ -267,17 +261,41 @@ def analyze_association_rules(df):
     """
     print("\n   分析关联规则...")
 
-    # 将特征转换为布尔值 (0 或 1)
-    df_encoded = df.applymap(lambda x: 1 if isinstance(x, (int, float)) and x > 0 else 0)
+    # 选择用于关联规则分析的特征列，并定义它们的二值化阈值
+    # 这里选择一些有意义的数值特征进行二值化
+    # 确保这些列在 df 中是数值类型且无NaN
+    df_apriori = df[['涨幅%', '实际换手%', '归属净利润', '总市值']].copy()
+    df_apriori = clean_and_convert_numeric(df_apriori, df_apriori.columns.tolist())
+
+    # 将数值特征转换为布尔值 (0 或 1)
+    # 定义一些有意义的阈值来创建二值化特征
+    df_encoded = pd.DataFrame()
+    df_encoded['涨幅_高'] = df_apriori['涨幅%'] > 3.0 # 涨幅大于3%
+    df_encoded['换手率_低'] = df_apriori['实际换手%'] < 10.0 # 换手率低于10%
+    df_encoded['净利润_高'] = df_apriori['归属净利润'] > 0.5 # 净利润大于0.5亿
+    df_encoded['市值_大'] = df_apriori['总市值'] > 500.0 # 市值大于500亿
 
     # 转换为布尔类型 DataFrame
     df_encoded = df_encoded.astype(bool)
 
+    # 移除全为 False 的行，这些行对关联规则没有贡献
+    df_encoded = df_encoded[df_encoded.any(axis=1)]
+
+    if df_encoded.empty:
+        print("   ⚠️ 没有足够的二值化数据进行关联规则分析。")
+        return pd.DataFrame()
+
     # 使用 Apriori 算法找到频繁项集
-    frequent_itemsets = apriori(df_encoded, min_support=0.05, use_colnames=True)  # 调整 min_support
+    # 调整 min_support，如果数据量大，可以适当提高
+    frequent_itemsets = apriori(df_encoded, min_support=0.01, use_colnames=True)
+
+    if frequent_itemsets.empty:
+        print("   ⚠️ 没有找到频繁项集。")
+        return pd.DataFrame()
 
     # 生成关联规则
-    rules = association_rules(frequent_itemsets, metric="confidence", min_threshold=0.5)  # 调整 metric 和 min_threshold
+    # 调整 metric 和 min_threshold
+    rules = association_rules(frequent_itemsets, metric="confidence", min_threshold=0.5)
 
     print(f"   找到 {len(rules)} 条关联规则")
     return rules
@@ -298,46 +316,28 @@ def main():
     # ========== 第一步：获取数据 ==========
     print("\n1. 获取A股数据...")
 
+    df = pd.DataFrame() # 初始化一个空的DataFrame
     # 先尝试获取实时数据
     try:
         print("   尝试获取实时数据...")
-        df = ak.stock_zh_a_spot_em()
-        print(f"   ✅ 成功获取 {len(df)} 只股票的实时数据")
+        df_realtime = ak.stock_zh_a_spot_em()
+        print(f"   ✅ 成功获取 {len(df_realtime)} 只股票的实时数据")
 
-        # 保存原始代码
-        df['原始代码'] = df['代码'].copy()
+        # 统一列名以匹配参考数据，并进行初步处理
+        df_realtime = df_realtime.rename(columns={
+            '最新价': '最新',
+            '涨跌幅': '涨幅%',
+            '换手率': '实际换手%',
+            '总市值': '总市值',
+            '市盈率-动态': '市盈率(动)' # 注意这里可能需要根据实际数据调整
+        })
 
-        # 格式化代码
-        df['代码'] = df['代码'].apply(lambda x: f'= "{str(x)}"')
+        # 确保所有关键列存在，如果不存在则创建并填充默认值
+        for col in ['20日均价', '60日均价', '所属行业', '归属净利润']:
+            if col not in df_realtime.columns:
+                df_realtime[col] = ' --'
 
-        # 格式化数值列
-        for col in ['最新价', '最高', '最低', '开盘', '昨收']:
-            if col in df.columns:
-                new_col = col.replace('价', '')
-                df[new_col] = df[col].astype(str).apply(  # 转换为字符串再处理
-                    lambda x: f" {float(x):.2f}" if pd.notna(x) and str(x) not in ['--', '', None] else " --"
-                )
-
-        if '涨跌幅' in df.columns:
-            df['涨幅%'] = df['涨跌幅'].astype(str).apply(  # 转换为字符串再处理
-                lambda x: f" {float(x):.2f}" if pd.notna(x) else " --"
-            )
-
-        if '换手率' in df.columns:
-            df['实际换手%'] = df['换手率'].astype(str).apply(  # 转换为字符串再处理
-                lambda x: f" {float(x):.2f}" if pd.notna(x) else " --"
-            )
-
-        # 处理名称
-        df['名称'] = df['名称'].apply(lambda x: f" {x}" if not str(x).startswith(' ') else x)
-
-        # 设置默认值
-        df['所属行业'] = '  其他'
-        df['20日均价'] = ' --'
-        df['60日均价'] = ' --'
-        df['归属净利润'] = ' --'
-        df['市盈率(动)'] = ' --'
-        df['总市值'] = ' --'
+        df = df_realtime.copy()
 
     except Exception as e:
         print(f"   ❌ 实时获取失败: {e}")
@@ -348,35 +348,46 @@ def main():
         try:
             df = pd.read_csv('参考数据/Table.xls', sep='\t', encoding='gbk', dtype=str)
             print(f"   ✅ 从参考文件加载了 {len(df)} 条数据")
-            df['原始代码'] = df['代码'].str.replace('= "', '').str.replace('"', '')
+            # 移除Excel公式前缀
+            df['代码'] = df['代码'].str.replace('= "', '').str.replace('"', '')
         except Exception as e2:
             print(f"   ❌ 无法加载参考数据: {e2}")
             return
 
-    # 尝试补充均线和财务数据
+    # 保存原始代码，用于后续合并和查找
+    df['原始代码'] = df['代码'].copy()
+
+    # 尝试补充均线和财务数据 (如果实时数据缺失)
     try:
         ref_df = pd.read_csv('参考数据/Table.xls', sep='\t', encoding='gbk', dtype=str)
-        ref_map = {}
-        for _, row in ref_df.iterrows():
-            code = str(row['代码']).replace('= "', '').replace('"', '')
-            ref_map[code] = row.to_dict()
+        ref_df['代码'] = ref_df['代码'].str.replace('= "', '').str.replace('"', '') # 清理参考数据代码
+        ref_map = ref_df.set_index('代码').to_dict('index')
 
-        # 合并参考数据
-        for i, code in enumerate(df.get('原始代码', [])):
-            if code in ref_map:
-                ref = ref_map[code]
-                # 补充缺失的数据
-                for col in ['20日均价', '60日均价', '所属行业', '归属净利润', '总市值', '市盈率(动)']:
-                    if col in ref:
-                        df.loc[i, col] = ref[col]
+        # 合并参考数据到主df
+        # 使用 merge 更高效和健壮
+        df = df.set_index('原始代码').combine_first(ref_df.set_index('代码')).reset_index()
+        df = df.rename(columns={'index': '原始代码'}) # 恢复列名
 
         print(f"   ✅ 补充了 {len(ref_map)} 条参考数据")
-    except:
-        print("   ⚠️ 无法补充参考数据")
+    except Exception as e:
+        print(f"   ⚠️ 无法补充参考数据: {e}")
+
+    # 对所有需要数值化的列进行清洗和转换
+    df = clean_and_convert_numeric(df, NUMERIC_COLS)
+
+    # 格式化代码为Excel公式，便于在Excel中点击
+    df['代码'] = df['原始代码'].apply(lambda x: f'= "{str(x)}"')
+
+    # 格式化数值列为字符串，用于最终输出，保留两位小数
+    for col in [c for c in NUMERIC_COLS if c in df.columns]:
+        df[col] = df[col].apply(lambda x: f" {x:.2f}" if pd.notna(x) else " --")
+
+    # 处理名称
+    df['名称'] = df['名称'].apply(lambda x: f" {x}" if pd.notna(x) and not str(x).startswith(' ') else str(x))
 
     # 添加序号
     df['序'] = range(1, len(df) + 1)
-    df['Unnamed: 16'] = ''
+    df['Unnamed: 16'] = '' # 空列
 
     # 选择输出列
     output_columns = [
@@ -385,11 +396,12 @@ def main():
         '市盈率(动)', '总市值', '归属净利润', '昨收', '开盘', 'Unnamed: 16'
     ]
 
+    # 确保所有输出列都存在
     for col in output_columns:
         if col not in df.columns:
             df[col] = ' --' if col != 'Unnamed: 16' else ''
 
-    final_df = df[output_columns]
+    final_df = df[output_columns].copy() # 复制一份，避免SettingWithCopyWarning
 
     # 保存A股数据
     output_file1 = '输出数据/A股数据.csv'
@@ -404,7 +416,8 @@ def main():
 
     # ========== 第二步：训练神经网络 ==========
     print("\n2. 训练神经网络模型...")
-    model, scaler, r2_score_nn = train_neural_network(final_df)
+    # 传递原始的df，让train_neural_network内部进行数值化和清洗
+    model, scaler, r2_score_nn = train_neural_network(df.copy()) # 传递副本
 
     if model is None:
         print("   ❌ 神经网络训练失败，无法进行后续筛选。")
@@ -412,47 +425,65 @@ def main():
 
     # ========== 第三步：分析关联规则 ==========
     print("\n3. 分析关联规则...")
-    rules = analyze_association_rules(final_df)
+    rules = analyze_association_rules(df.copy()) # 传递副本
 
     # ========== 第四步：动态筛选优质股票 ==========
     print("\n4. 动态筛选优质股票...")
 
+    # 重新加载或确保 df 包含原始数值数据，以便神经网络评分
+    # 这里使用原始的 df (已经过 clean_and_convert_numeric 处理的)
+    df_for_scoring = df.copy()
+    df_for_scoring = clean_and_convert_numeric(df_for_scoring, NUMERIC_COLS)
+
     # 创建一个包含所有股票评分的列
-    final_df['神经网络评分'] = final_df.apply(lambda row: predict_score_with_nn(row, model, scaler), axis=1)
+    df_for_scoring['神经网络评分'] = df_for_scoring.apply(lambda row: predict_score_with_nn(row, model, scaler), axis=1)
 
     quality_stocks = []
-    threshold = 0.0  # 调整阈值以获得更多结果
+    # 初始阈值可以根据神经网络评分分布来定，或者先设一个较低的值
+    # 比如，取所有股票评分的20%分位数作为初始阈值
+    if not df_for_scoring['神经网络评分'].empty:
+        initial_threshold = df_for_scoring['神经网络评分'].quantile(0.75) # 取75%分位数
+    else:
+        initial_threshold = 0.0
+    
+    threshold = initial_threshold
+    print(f"   初始筛选阈值: {threshold:.4f}")
 
     # 统计
     stats = {'F': 0, 'G': 0, 'H': 0, 'I': 0, 'J': 0}
 
-    for idx, row in final_df.iterrows():
+    for idx, row in df_for_scoring.iterrows():
         score_nn = row['神经网络评分']  # 神经网络评分
         conditions = ""
 
-        # 统计（原始评分方式的统计，如果只用神经网络，可以移除）
+        # 统计（原始评分方式的统计）
         features = calculate_features(row)
         if features[0] == 1: stats['F'] += 1
         if features[1] == 1: stats['G'] += 1
         if features[2] > 0.3: stats['H'] += 1
-        if features[3] <= 25: stats['I'] += 1
-        if features[4] >= 200: stats['J'] += 1
+        if features[3] <= 20: stats['I'] += 1 # 换手率 <= 20%
+        if features[4] >= 300: stats['J'] += 1 # 市值 >= 300亿
 
-        #  综合评分：神经网络评分 + 关联规则加权
-        #  这里只是一个示例，你需要根据你的关联规则分析结果来设计加权策略
+        # 综合评分：神经网络评分 + 关联规则加权
+        # 这里只是一个示例，你需要根据你的关联规则分析结果来设计加权策略
         score_rules = 0.0  # 初始关联规则评分
-
-        #  示例：如果股票满足某些关联规则，则增加评分
-        #  你需要根据你的关联规则分析结果来设计具体的规则判断逻辑
-        # for rule in rules:
-        #     if row['所属行业'] in rule.antecedents and row['涨幅%'] in rule.consequents:
-        #         score_rules += rule.confidence  # 使用置信度作为加权
+        # 示例：如果股票满足某些关联规则，则增加评分
+        # 你需要根据你的关联规则分析结果来设计具体的规则判断逻辑
+        # 例如：
+        # if not rules.empty:
+        #     for _, rule_row in rules.iterrows():
+        #         antecedent = list(rule_row['antecedents'])
+        #         consequent = list(rule_row['consequents'])
+        #         # 假设你的规则是 '涨幅_高' -> '净利润_高'
+        #         if '涨幅_高' in antecedent and row['涨幅%'] > 3.0 and \
+        #            '净利润_高' in consequent and row['归属净利润'] > 0.5:
+        #             score_rules += rule_row['confidence'] * 0.1 # 简单加权
 
         final_score = score_nn + score_rules  # 综合评分
 
         # 判断是否达标
         if final_score >= threshold:
-            code = str(row['代码']).replace('= "', '').replace('"', '')
+            code = str(row['原始代码']).strip() # 使用原始代码
             quality_stocks.append({
                 '代码': code,
                 '名称': str(row['名称']).strip(),
@@ -463,43 +494,52 @@ def main():
             })
 
     # 打印统计
-    total = len(final_df)
-    if total > 0:
-        print(f"\n   条件满足统计（共{total}只股票）：")
-        print(f"   F列(价格位置): {stats['F']}只 ({stats['F']/total*100:.1f}%)")
-        print(f"   G列(涨幅条件): {stats['G']}只 ({stats['G']/total*100:.1f}%)")
-        print(f"   H列(净利润): {stats['H']}只 ({stats['H']/total*100:.1f}%)")
-        print(f"   I列(换手率): {stats['I']}只 ({stats['I']/total*100:.1f}%)")
-        print(f"   J列(市值): {stats['J']}只 ({stats['J']/total*100:.1f}%)")
+    total_stocks_evaluated = len(df_for_scoring)
+    if total_stocks_evaluated > 0:
+        print(f"\n   条件满足统计（共{total_stocks_evaluated}只股票）：")
+        print(f"   F列(价格位置): {stats['F']}只 ({stats['F']/total_stocks_evaluated*100:.1f}%)")
+        print(f"   G列(涨幅条件): {stats['G']}只 ({stats['G']/total_stocks_evaluated*100:.1f}%)")
+        print(f"   H列(净利润>=0.3亿): {stats['H']}只 ({stats['H']/total_stocks_evaluated*100:.1f}%)")
+        print(f"   I列(换手率<=20%): {stats['I']}只 ({stats['I']/total_stocks_evaluated*100:.1f}%)")
+        print(f"   J列(市值>=300亿): {stats['J']}只 ({stats['J']/total_stocks_evaluated*100:.1f}%)")
 
     # 按优质率降序排序
     quality_stocks = sorted(quality_stocks, key=lambda x: (x['优质率'], x['代码']), reverse=True)
 
-    # 如果结果太少，尝试降低阈值
-    if len(quality_stocks) < 10:
-        print(f"\n   ⚠️ 只找到{len(quality_stocks)}只股票，尝试降低阈值...")
-        threshold = np.percentile([stock['优质率'] for stock in quality_stocks], 25) if quality_stocks else 0  # 使用25%分位数作为阈值
+    # 如果结果太少，尝试降低阈值，或者直接取前N名
+    if len(quality_stocks) < 10 and len(df_for_scoring) > 0:
+        print(f"\n   ⚠️ 只找到{len(quality_stocks)}只股票，尝试降低阈值并取前12名...")
+        # 重新根据所有股票的神经网络评分排序，取前12名
+        all_stocks_sorted_by_nn_score = sorted(
+            df_for_scoring.to_dict('records'),
+            key=lambda x: x['神经网络评分'] if pd.notna(x['神经网络评分']) else -np.inf,
+            reverse=True
+        )
+        
         quality_stocks = []
-
-        for idx, row in final_df.iterrows():
-            score = row['神经网络评分']
-            if score >= threshold:
-                code = str(row['代码']).replace('= "', '').replace('"', '')
-                quality_stocks.append({
-                    '代码': code,
-                    '名称': str(row['名称']).strip(),
-                    '行业': str(row['所属行业']).strip(),
-                    '优质率': score,
-                    '满足条件': "",
-                    '涨幅': str(row['涨幅%']).strip()
-                })
-
+        for stock_data in all_stocks_sorted_by_nn_score[:12]:
+            code = str(stock_data['原始代码']).strip()
+            quality_stocks.append({
+                '代码': code,
+                '名称': str(stock_data['名称']).strip(),
+                '行业': str(stock_data['所属行业']).strip(),
+                '优质率': stock_data['神经网络评分'],
+                '满足条件': "", # 此时条件不明确，清空
+                '涨幅': str(stock_data['涨幅%']).strip()
+            })
+        
+        # 重新排序，确保最终结果的优质率是正确的
         quality_stocks = sorted(quality_stocks, key=lambda x: (x['优质率'], x['代码']), reverse=True)
-        quality_stocks = quality_stocks[:12]  # 只取前12只
+        # 更新阈值，以便报告
+        if quality_stocks:
+            threshold = quality_stocks[-1]['优质率'] # 此时阈值是第12名的优质率
+        else:
+            threshold = 0.0
 
-    #  计算最终模型评分 (示例)
-    final_model_score = (r2_score_nn + len(rules) * 0.1)  #  神经网络 R^2 + 关联规则数量加权
-    #  请根据实际情况调整评分计算方式
+
+    # 计算最终模型评分 (示例)
+    final_model_score = (r2_score_nn * 100 + len(rules) * 0.5) # 神经网络 R^2 乘以100，关联规则数量加权
+    # 请根据实际情况调整评分计算方式
 
     # 保存优质股票
     output_file2 = '输出数据/优质股票.txt'
@@ -510,7 +550,7 @@ def main():
             f.write(f"模型最终评分: {final_model_score:.4f}\n")  # 显示模型最终评分
             f.write(f"神经网络 R^2: {r2_score_nn:.4f}\n")  # 显示神经网络的 R^2
             f.write(f"关联规则数量: {len(rules)}\n")  # 显示关联规则数量
-            f.write(f"筛选阈值: {threshold:.4f}\n")  # 显示神经网络的阈值
+            f.write(f"最终筛选阈值: {threshold:.4f}\n")  # 显示神经网络的阈值
             f.write(f"优质股票数量: {len(quality_stocks)}\n")
             f.write("=" * 50 + "\n\n")
 
@@ -528,30 +568,21 @@ def main():
         print(f"\n❌ 无法保存优质股票: {e}")
         print(f"   错误信息: {e}")
 
-    print(f"   找到 {len(quality_stocks)} 只优质股票（阈值={threshold:.4f}）")  # 显示神经网络的阈值
+    print(f"   找到 {len(quality_stocks)} 只优质股票（最终阈值={threshold:.4f}）")
 
     if len(quality_stocks) > 0:
         print(f"\n🎯 今日优质股票列表：")
         print("=" * 60)
-        print("股票代码    股票名称        涨幅%      优质率")
+        print(f"{'股票代码':<10} {'股票名称':<12} {'涨幅%':<8} {'优质率':<10}")
         print("-" * 60)
-        for stock in quality_stocks[:12]:
-            print(f"{stock['代码']:8}    {stock['名称']:12}    {stock['涨幅']:6}    {stock['优质率']:.4f}")  # 显示神经网络的评分
+        for stock in quality_stocks[:12]: # 确保只打印前12个
+            print(f"{stock['代码']:<10} {stock['名称']:<12} {stock['涨幅']:<8} {stock['优质率']:.4f}")
     else:
         print("\n⚠️ 今日没有找到符合条件的优质股票")
         print("   可能原因：")
         print("   1. 市场整体表现不佳，涨幅不足")
         print("   2. 数据获取不完整")
-        print("   3. 筛选条件过于严格")
-
-    # 将包含神经网络评分的 DataFrame 保存到 CSV
-    output_file1 = '输出数据/A股数据.csv'
-    try:
-        final_df.to_csv(output_file1, index=False, encoding='utf-8-sig')
-        print(f"\n✅ 包含神经网络评分的 A 股数据已保存: {output_file1}")
-    except Exception as e:
-        print(f"\n❌ 无法保存包含神经网络评分的 A 股数据: {e}")
-        print(f"   错误信息: {e}")
+        print("3. 筛选条件过于严格，或模型区分度不足")
 
     print("\n" + "=" * 60)
     print("✅ 程序执行完成！")
@@ -560,3 +591,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
